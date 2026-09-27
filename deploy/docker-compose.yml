@@ -51,12 +51,32 @@ services:
       REDIS_ADDR: "redis:6379"
       POSTGRES_DSN: "postgres://bench:bench@postgres:5432/bench?sslmode=disable"
       DAPR_GRPC_PORT: "50001"
-      PAYLOAD_BYTES: "10240"
-      KEYSPACE: "1000"
-      CONCURRENCY: "1000"
-      RATE: "200000"
-      WARMUP: "10s"
-      DURATION: "10m" # 0 runs until stopped; set e.g. 5m for a fixed experiment
+
+      # Which pair to compare in this run. At most two connectors, so only one
+      # backend is ever under load. Override per run: CONNECTORS=nats-direct,nats-dapr
+      CONNECTORS: "${CONNECTORS:-redis-direct,redis-dapr}"
+
+      # Baseline point: every sweep varies one of these while holding the others.
+      RATE: "${RATE:-200}"                    # ops/sec, 0 = closed loop (no stall measured)
+      PAYLOAD_BYTES: "${PAYLOAD_BYTES:-256}"
+      CONCURRENCY: "${CONCURRENCY:-8}"        # concurrent callers ("agents")
+      KEYSPACE: "${KEYSPACE:-1000}"
+
+      # Levels to sweep per dimension. An empty list skips that dimension.
+      SWEEP_MODE: "${SWEEP_MODE:-oat}"        # oat = one dimension at a time; grid = every combination
+      SWEEP_RATE: "${SWEEP_RATE-50,200,1000,5000,20000}"
+      SWEEP_PAYLOAD_BYTES: "${SWEEP_PAYLOAD_BYTES-256,1024,4096,16384}"
+      SWEEP_CONCURRENCY: "${SWEEP_CONCURRENCY-1,8,32,128}"
+
+      # Per step, per connector.
+      STEP_WARMUP: "${STEP_WARMUP:-5s}"       # discarded
+      STEP_DURATION: "${STEP_DURATION:-30s}"  # measured
+      STEP_COOLDOWN: "${STEP_COOLDOWN:-5s}"   # idle gap before the next connector starts
+      OP_TIMEOUT: "${OP_TIMEOUT:-5s}"
+
+      RESULTS_DIR: "/traces"
+    volumes:
+      - ../traces:/traces
     ports:
       - "9100:9100" # bench exporter
       - "9090:9090" # dapr sidecar metrics (same namespace, see below)

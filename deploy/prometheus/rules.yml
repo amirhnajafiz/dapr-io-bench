@@ -1,11 +1,12 @@
-# Recording rules that turn raw histograms into the six comparable numbers and
-# the direct-vs-Dapr ratio derived from them.
+# Recording rules for watching a sweep live. The trace file the app writes is
+# the record of a run; these views exist so a step can be eyeballed in
+# Prometheus while it happens. Connectors run one at a time, so at any moment
+# only one of a pair has fresh samples.
 groups:
   - name: dapr-overhead
     interval: 15s
     rules:
-      # Median and tail latency per connector, labelled {backend, mode, op}.
-      # p95 is the one to quote for user-facing latency; p99 catches sidecar stalls.
+      # Service latency per connector, labelled {backend, mode, op}.
       - record: bench:latency_p50
         expr: histogram_quantile(0.50, sum by (backend, mode, op, le) (rate(bench_op_duration_seconds_bucket[1m])))
       - record: bench:latency_p95
@@ -13,18 +14,13 @@ groups:
       - record: bench:latency_p99
         expr: histogram_quantile(0.99, sum by (backend, mode, op, le) (rate(bench_op_duration_seconds_bucket[1m])))
 
+      # Stall: how long a call waited past its scheduled send time before it
+      # could start. Zero while the connector keeps up with the target rate.
+      - record: bench:stall_p50
+        expr: histogram_quantile(0.50, sum by (backend, mode, op, le) (rate(bench_op_stall_seconds_bucket[1m])))
+      - record: bench:stall_p99
+        expr: histogram_quantile(0.99, sum by (backend, mode, op, le) (rate(bench_op_stall_seconds_bucket[1m])))
+
       # Successful operations per second per connector.
       - record: bench:throughput
         expr: sum by (backend, mode, op) (rate(bench_ops_total{status="ok"}[1m]))
-
-      # The headline number: how many times slower the Dapr path is than the
-      # direct path for the same backend and operation. 1.0 means no overhead.
-      - record: bench:dapr_overhead_ratio_p50
-        expr: bench:latency_p50{mode="dapr"} / ignoring(mode) bench:latency_p50{mode="direct"}
-      - record: bench:dapr_overhead_ratio_p99
-        expr: bench:latency_p99{mode="dapr"} / ignoring(mode) bench:latency_p99{mode="direct"}
-
-      # Absolute cost of the sidecar hop, in seconds, for those who prefer it
-      # to a ratio.
-      - record: bench:dapr_overhead_seconds_p50
-        expr: bench:latency_p50{mode="dapr"} - ignoring(mode) bench:latency_p50{mode="direct"}

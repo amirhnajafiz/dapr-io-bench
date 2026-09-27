@@ -59,7 +59,7 @@ func Load() (Config, error) {
 				PayloadBytes: envInt("PAYLOAD_BYTES", 256),
 				Concurrency:  envInt("CONCURRENCY", 8),
 			},
-			Rates:         envInts("SWEEP_RATE", "50,200,1000,5000,20000"),
+			Rates:         envInts("SWEEP_RATE", "0,50,200,1000,5000,20000,50000,100000"),
 			PayloadBytes:  envInts("SWEEP_PAYLOAD_BYTES", "256,1024,4096,16384"),
 			Concurrencies: envInts("SWEEP_CONCURRENCY", "1,8,32,128"),
 

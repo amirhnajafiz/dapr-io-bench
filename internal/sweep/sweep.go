@@ -188,8 +188,12 @@ func Run(ctx context.Context, conns []connector.Connector, w *connector.Workload
 		for _, c := range conns {
 			step++
 			name := connector.Name(c)
-			log.Printf("step %d/%d [%s] %s rate=%d payload=%dB concurrency=%d",
-				step, len(pts)*len(conns), pt.Dimension, name, pt.Rate, pt.PayloadBytes, pt.Concurrency)
+			rate := strconv.Itoa(pt.Rate)
+			if pt.Rate == 0 {
+				rate = "closed-loop"
+			}
+			log.Printf("step %d/%d [%s] %s rate=%s payload=%dB concurrency=%d",
+				step, len(pts)*len(conns), pt.Dimension, name, rate, pt.PayloadBytes, pt.Concurrency)
 			metrics.SetStep(id, pt.Dimension, name,
 				strconv.Itoa(pt.Rate), strconv.Itoa(pt.PayloadBytes), strconv.Itoa(pt.Concurrency))
 

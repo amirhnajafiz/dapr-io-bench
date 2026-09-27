@@ -10,6 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/amirtkz/dapr-overhead-bench/internal/connector"
 	"github.com/amirtkz/dapr-overhead-bench/internal/metrics"
 	"github.com/amirtkz/dapr-overhead-bench/internal/stats"
@@ -205,7 +208,7 @@ func drive(ctx context.Context, c connector.Connector, opt Options, record bool)
 				col.wait[idx].Observe(stall + latency)
 				if err != nil {
 					col.errors[idx]++
-					if errors.Is(err, context.DeadlineExceeded) {
+					if isTimeout(err) {
 						col.timeouts[idx]++
 					}
 					if col.firstErr[idx] == "" {
@@ -257,6 +260,12 @@ func drive(ctx context.Context, c connector.Connector, opt Options, record bool)
 	}
 
 	return res
+}
+
+// isTimeout recognises OpTimeout firing on either side of the sidecar: the
+// direct SDKs return the context error, the Dapr client a gRPC status.
+func isTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded
 }
 
 func ms(seconds float64) string { return fmt.Sprintf("%.2fms", seconds*1000) }

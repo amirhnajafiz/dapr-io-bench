@@ -91,7 +91,8 @@ def series(records, dimension):
         out[(r["op"], held)][r["mode"]].append((r[dimension], r))
     for group in out.values():
         for mode in group:
-            group[mode].sort(key=lambda p: p[0])
+            # a closed-loop point (rate 0) is the ceiling, so it sorts last
+            group[mode].sort(key=lambda p: (p[0] == 0, p[0]))
     # a group needs at least two x values to be a curve
     return {
         k: g for k, g in out.items()
@@ -120,20 +121,31 @@ def nice_ticks(top, count=4):
 
 
 def fmt(value, unit):
-    if unit == "ops/s":
-        return f"{value:,.0f}"
-    if unit == "%":
-        return f"{value:.1f}"
+    """A data label: three significant figures, never rounding a small value
+    to zero (an error rate of 0.033% must not print as 0.0)."""
     if value == 0:
         return "0"
-    if value < 1:
-        return f"{value:.2f}"
-    return f"{value:.1f}" if value < 100 else f"{value:,.0f}"
+    if unit == "ops/s":
+        return f"{value:,.0f}"
+    if abs(value) < 1:
+        return f"{value:.2g}"
+    return f"{value:.3g}" if abs(value) < 1000 else f"{value:,.0f}"
+
+
+def fmt_tick(value, step, unit):
+    """An axis tick: as many decimals as the step needs, so 0, 0.05, 0.1
+    never collapse into 0.0, 0.1, 0.1."""
+    if unit == "ops/s" or step >= 1:
+        return f"{value:,.0f}"
+    decimals = max(0, -math.floor(math.log10(step)))
+    return f"{value:.{decimals}f}"
 
 
 def fmt_x(x):
     """Axis label for a swept level: round thousands as 5k, anything else
     with a separator, so 1024 stays 1,024 rather than 1.024k."""
+    if x == 0:
+        return "closed loop"
     if x >= 1_000_000 and x % 1_000_000 == 0:
         return f"{x // 1_000_000}M"
     if x >= 1000 and x % 1000 == 0:
@@ -142,12 +154,16 @@ def fmt_x(x):
 
 
 # --- Layout (px) --------------------------------------------------------------
-PANEL_W, PANEL_H = 440, 290  # one metric per panel
+PANEL_W, PANEL_H = 500, 250  # one metric per panel, title and axes included
 COLS = 2
-PAD, GAP_X, GAP_Y = 32, 40, 48
-AXIS_L, AXIS_B = 60, 34  # room for y tick labels / x tick labels inside a panel
-LABEL_W = 48  # room to the right of the last point for its end label
-HEAD = 76  # centred title + legend block above the first row
+PAD, GAP_X, GAP_Y = 28, 44, 30
+AXIS_L, AXIS_B = 66, 52  # room for y tick labels / x tick labels inside a panel
+TITLE_H = 30  # panel title strip above the plot area
+LABEL_W = 56  # room to the right of the last point for its end label
+CLOSED_W = 78  # slot at the right end of the RPS axis for the closed-loop point
+HEAD = 78  # centred title + legend block above the first row
+AXIS = "#8a8985"  # the two axis lines, a step darker than the grid
+STROKE = 3  # series line width
 
 
 def x_scale(levels, width):
@@ -161,91 +177,145 @@ def x_scale(levels, width):
     return lambda x: width * (math.log10(x) - llo) / (lhi - llo)
 
 
+def log_ticks(lo, hi):
+    """Decade ticks covering [lo, hi], for a log y axis."""
+    lo_exp = math.floor(math.log10(lo)) if lo > 0 else 0
+    hi_exp = math.ceil(math.log10(hi)) if hi > 0 else 1
+    if hi_exp == lo_exp:
+        hi_exp += 1
+    return [10.0 ** e for e in range(lo_exp, hi_exp + 1)]
+
+
 def render(backend, op, dimension, group, out_path):
     """Writes one SVG: a panel per metric, direct and dapr curves in each."""
     metrics = list(METRICS)
     levels = sorted({x for pts in group.values() for x, _ in pts})
+    # A closed-loop point (rate 0) is not a rate: it is each path's ceiling,
+    # so it sits in its own slot past the end of the log axis.
+    paced = [x for x in levels if x > 0]
+    closed = dimension == "rate" and 0 in levels
     rows = math.ceil(len(metrics) / COLS)
     width = PAD * 2 + COLS * PANEL_W + (COLS - 1) * GAP_X
     height = PAD + HEAD + rows * PANEL_H + (rows - 1) * GAP_Y + PAD
+    dim_label = DIMENSIONS[dimension]["label"]
 
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" font-family="system-ui, -apple-system, sans-serif">',
         f'<rect width="{width}" height="{height}" fill="{SURFACE}"/>',
-        f'<text x="{width / 2:.1f}" y="{PAD}" font-size="18" font-weight="600" fill="{INK}" text-anchor="middle">'
-        f'{esc(backend)} {esc(op)} <tspan font-weight="400" fill="{INK_MUTED}">vs {esc(DIMENSIONS[dimension]["label"])}</tspan></text>',
+        f'<text x="{width / 2:.1f}" y="{PAD + 6}" font-size="22" font-weight="600" fill="{INK}" text-anchor="middle">'
+        f'{esc(backend)} {esc(op)} <tspan font-weight="400" fill="{INK_MUTED}">vs {esc(dim_label)}</tspan></text>',
     ]
     # Legend, centred under the title: always present for two series, so
-    # identity is never colour-alone.
-    entry_w, key_w = 90, 18
-    lx = width / 2 - (entry_w * len(MODES) - (entry_w - key_w - 8 - 34)) / 2
-    ly = PAD + 26
+    # identity is never colour-alone. Dapr is dashed as well as orange, so the
+    # two stay tellable where they overlap.
+    key_w, gap, entry_gap = 28, 8, 40
+    text_w = {"direct": 44, "dapr": 36}
+    total = sum(key_w + gap + text_w[m] for m in MODES) + entry_gap * (len(MODES) - 1)
+    lx = width / 2 - total / 2
+    ly = PAD + 34
     for mode in MODES:
-        svg.append(f'<line x1="{lx:.1f}" y1="{ly}" x2="{lx + key_w:.1f}" y2="{ly}" stroke="{RGB[mode]}" stroke-width="2" stroke-linecap="round"/>')
-        svg.append(f'<circle cx="{lx + key_w / 2:.1f}" cy="{ly}" r="4" fill="{RGB[mode]}" stroke="{SURFACE}" stroke-width="2"/>')
-        svg.append(f'<text x="{lx + key_w + 8:.1f}" y="{ly + 4}" font-size="12" fill="{INK_MUTED}">{mode}</text>')
-        lx += entry_w
+        svg.append(f'<line x1="{lx:.1f}" y1="{ly}" x2="{lx + key_w:.1f}" y2="{ly}" {stroke_attrs(mode)}/>')
+        svg.append(f'<circle cx="{lx + key_w / 2:.1f}" cy="{ly}" r="5" fill="{RGB[mode]}" stroke="{SURFACE}" stroke-width="2"/>')
+        svg.append(f'<text x="{lx + key_w + gap:.1f}" y="{ly + 5}" font-size="14" fill="{INK}">{mode}</text>')
+        lx += key_w + gap + text_w[mode] + entry_gap
 
     plot_w = PANEL_W - AXIS_L - LABEL_W
-    plot_h = PANEL_H - AXIS_B - 20
-    sx = x_scale(levels, plot_w)
+    plot_h = PANEL_H - TITLE_H - AXIS_B
+    line_w = plot_w - (CLOSED_W if closed else 0)
+    sx_paced = x_scale(paced or [1], line_w)
+    sx = lambda x: sx_paced(x) if x > 0 else plot_w  # noqa: E731
 
     for n, metric in enumerate(metrics):
         title, unit, scale, get, higher_better = METRICS[metric]
         ox = PAD + (n % COLS) * (PANEL_W + GAP_X) + AXIS_L
-        oy = PAD + HEAD + (n // COLS) * (PANEL_H + GAP_Y) + 20
+        oy = PAD + HEAD + (n // COLS) * (PANEL_H + GAP_Y) + TITLE_H
         curves = {
             mode: [(x, get(r) * scale) for x, r in group.get(mode, [])] for mode in MODES
         }
-        peak = max((v for pts in curves.values() for _, v in pts), default=0)
-        axis_max, ticks = nice_ticks(peak)
-        sy = lambda v: oy + plot_h - plot_h * (v / axis_max)  # noqa: E731
+        values = [v for pts in curves.values() for _, v in pts]
+        peak = max(values, default=0)
+
+        # Throughput against RPS spans orders of magnitude and tracks the
+        # target, so it gets a log axis: a path that keeps up is a straight
+        # diagonal, and one that falls behind visibly bends away from it.
+        logy = metric == "throughput" and dimension == "rate" and min(values, default=0) > 0
+        if logy:
+            ticks = log_ticks(min(values), peak)
+            lo, hi = math.log10(ticks[0]), math.log10(ticks[-1])
+            sy = lambda v: oy + plot_h - plot_h * (math.log10(v) - lo) / (hi - lo)  # noqa: E731
+            step = None
+        else:
+            axis_max, ticks = nice_ticks(peak)
+            step = ticks[1] - ticks[0]
+            sy = lambda v: oy + plot_h - plot_h * (v / axis_max)  # noqa: E731
 
         better = "higher is better" if higher_better else "lower is better"
         svg.append(
-            f'<text x="{ox - AXIS_L}" y="{oy - 10}" font-size="13" font-weight="600" fill="{INK}">'
+            f'<text x="{ox - AXIS_L}" y="{oy - 12}" font-size="15" font-weight="600" fill="{INK}">'
             f'{esc(title)} <tspan font-weight="400" fill="{INK_MUTED}">({unit}, {better})</tspan></text>'
         )
         # Gridlines first, so marks paint over them.
         for t in ticks:
             y = sy(t)
             svg.append(f'<line x1="{ox}" y1="{y:.1f}" x2="{ox + plot_w}" y2="{y:.1f}" stroke="{GRID}" stroke-width="1"/>')
-            svg.append(f'<text x="{ox - 8}" y="{y + 3.5:.1f}" font-size="10.5" fill="{INK_MUTED}" text-anchor="end">{fmt(t, unit)}</text>')
-        for x in levels:
+            label = fmt(t, unit) if logy else fmt_tick(t, step, unit)
+            svg.append(f'<text x="{ox - 10}" y="{y + 4.5:.1f}" font-size="13" fill="{INK}" text-anchor="end">{label}</text>')
+        last_label_x = None
+        for x in paced + ([0] if closed else []):  # left to right, ceiling last
             px = ox + sx(x)
-            svg.append(f'<line x1="{px:.1f}" y1="{oy + plot_h}" x2="{px:.1f}" y2="{oy + plot_h + 4}" stroke="{GRID}" stroke-width="1"/>')
-            svg.append(f'<text x="{px:.1f}" y="{oy + plot_h + 17}" font-size="10.5" fill="{INK_MUTED}" text-anchor="middle">{fmt_x(x)}</text>')
-        svg.append(f'<text x="{ox + plot_w / 2:.1f}" y="{oy + plot_h + 31}" font-size="10.5" fill="{INK_MUTED}" text-anchor="middle">{esc(DIMENSIONS[dimension]["label"])}</text>')
+            svg.append(f'<line x1="{px:.1f}" y1="{oy + plot_h}" x2="{px:.1f}" y2="{oy + plot_h + 5}" stroke="{AXIS}" stroke-width="1.5"/>')
+            # neighbouring levels on a log axis (50k, 100k) can land too close
+            # for their labels; the second one drops to a lower row
+            row = 1 if last_label_x is not None and px - last_label_x < 40 else 0
+            svg.append(f'<text x="{px:.1f}" y="{oy + plot_h + 21 + 15 * row}" font-size="13" fill="{INK}" text-anchor="middle">{fmt_x(x)}</text>')
+            last_label_x = None if row else px
+        svg.append(f'<text x="{ox + line_w / 2:.1f}" y="{oy + plot_h + 48}" font-size="13" fill="{INK_MUTED}" text-anchor="middle">{esc(dim_label)}</text>')
+        if closed:
+            # a divider between the paced region and the ceiling slot
+            dx = ox + line_w + CLOSED_W / 2
+            svg.append(f'<line x1="{dx:.1f}" y1="{oy}" x2="{dx:.1f}" y2="{oy + plot_h}" stroke="{GRID}" stroke-width="1"/>')
+        # The two axes, drawn after the grid so they sit on top of it.
+        svg.append(f'<line x1="{ox}" y1="{oy}" x2="{ox}" y2="{oy + plot_h}" stroke="{AXIS}" stroke-width="1.5"/>')
+        svg.append(f'<line x1="{ox}" y1="{oy + plot_h}" x2="{ox + plot_w}" y2="{oy + plot_h}" stroke="{AXIS}" stroke-width="1.5"/>')
 
-        # Lines, then markers with a surface ring, then one end label per series.
+        # Lines through the paced points only (the closed-loop point is a
+        # different regime, so it is a marker on its own), then markers with a
+        # surface ring, then one end label per series.
         for mode in MODES:
-            pts = curves[mode]
-            if not pts:
+            pts = [(x, v) for x, v in curves[mode] if x > 0]
+            if len(pts) < 2:
                 continue
             path = " ".join(f'{"M" if i == 0 else "L"}{ox + sx(x):.1f},{sy(v):.1f}' for i, (x, v) in enumerate(pts))
-            svg.append(f'<path d="{path}" fill="none" stroke="{RGB[mode]}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>')
+            svg.append(f'<path d="{path}" fill="none" {stroke_attrs(mode)}/>')
         for mode in MODES:
             for x, v in curves[mode]:
-                svg.append(f'<circle cx="{ox + sx(x):.1f}" cy="{sy(v):.1f}" r="4.5" fill="{RGB[mode]}" stroke="{SURFACE}" stroke-width="2"/>')
+                r = 7 if x == 0 else 5
+                svg.append(f'<circle cx="{ox + sx(x):.1f}" cy="{sy(v):.1f}" r="{r}" fill="{RGB[mode]}" stroke="{SURFACE}" stroke-width="2"/>')
         # End labels sit to the right of the last point; when the two series
         # end close together the labels are nudged apart, keeping their order.
         ends = {mode: curves[mode][-1] for mode in MODES if curves[mode]}
         ys = {mode: sy(v) for mode, (_, v) in ends.items()}
-        if len(ys) == 2 and abs(ys["direct"] - ys["dapr"]) < 13:
+        if len(ys) == 2 and abs(ys["direct"] - ys["dapr"]) < 16:
             mid = (ys["direct"] + ys["dapr"]) / 2
             upper = min(ys, key=ys.get)
             for mode in ys:
-                ys[mode] = mid - 6.5 if mode == upper else mid + 6.5
+                ys[mode] = mid - 8 if mode == upper else mid + 8
         for mode, (x, v) in ends.items():
             svg.append(
-                f'<text x="{ox + sx(x) + 9:.1f}" y="{ys[mode] + 4:.1f}" font-size="11" fill="{INK_MUTED}">'
+                f'<text x="{ox + sx(x) + 10:.1f}" y="{ys[mode] + 4.5:.1f}" font-size="13" fill="{INK}">'
                 f'{fmt(v, unit)}</text>'
             )
 
     svg.append("</svg>")
     with open(out_path, "w") as fh:
         fh.write("\n".join(svg))
+
+
+def stroke_attrs(mode):
+    """Series stroke: solid for direct, dashed for Dapr, both bold."""
+    dash = ' stroke-dasharray="9 6"' if mode == "dapr" else ""
+    return f'stroke="{RGB[mode]}" stroke-width="{STROKE}" stroke-linejoin="round" stroke-linecap="round"{dash}'
 
 
 # --- Summary table ------------------------------------------------------------
@@ -265,7 +335,7 @@ def summary_rows(dimension, group):
         for x, r in group.get(mode, []):
             by_x[x][mode] = r
     rows = []
-    for x in sorted(by_x):
+    for x in sorted(by_x, key=lambda x: (x == 0, x)):
         cells = [fmt_x(x)]
         for _, metric in TABLE_COLS:
             _, unit, scale, get, higher_better = METRICS[metric]

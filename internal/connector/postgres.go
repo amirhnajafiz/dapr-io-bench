@@ -11,11 +11,11 @@ import (
 // PostgresDirect uses pgx against a single key/value table.
 type PostgresDirect struct {
 	dsn      string
-	workload Workload
+	workload *Workload
 	pool     *pgxpool.Pool
 }
 
-func NewPostgresDirect(dsn string, w Workload) *PostgresDirect {
+func NewPostgresDirect(dsn string, w *Workload) *PostgresDirect {
 	return &PostgresDirect{dsn: dsn, workload: w}
 }
 
@@ -60,7 +60,7 @@ func (p *PostgresDirect) Ops() []Op {
 				_, err := p.pool.Exec(ctx,
 					`INSERT INTO bench_kv (key, value) VALUES ($1, $2)
 				 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-					p.workload.Key(i), p.workload.Payload)
+					p.workload.Key(i), p.workload.Payload())
 				return err
 			},
 		},
@@ -88,10 +88,10 @@ func (p *PostgresDirect) Close() error {
 type PostgresDapr struct {
 	daprBase
 	store    string
-	workload Workload
+	workload *Workload
 }
 
-func NewPostgresDapr(grpcPort, store string, w Workload) *PostgresDapr {
+func NewPostgresDapr(grpcPort, store string, w *Workload) *PostgresDapr {
 	return &PostgresDapr{daprBase: daprBase{grpcPort: grpcPort}, store: store, workload: w}
 }
 
@@ -104,7 +104,7 @@ func (p *PostgresDapr) Ops() []Op {
 		{
 			Name: "write",
 			Run: func(ctx context.Context, i int) error {
-				return p.client.SaveState(ctx, p.store, p.workload.Key(i), p.workload.Payload, nil)
+				return p.client.SaveState(ctx, p.store, p.workload.Key(i), p.workload.Payload(), nil)
 			},
 		},
 		{

@@ -25,6 +25,10 @@ type Op struct {
 }
 
 // Connector is one of the six benchmarked data paths.
+//
+// Ops are independent of each other: the sweep seeds every key through the
+// "write" op before measuring, so a "read" never depends on the write that
+// happened to precede it.
 type Connector interface {
 	// Backend reports which backing service is exercised (nats/postgres/redis).
 	Backend() string

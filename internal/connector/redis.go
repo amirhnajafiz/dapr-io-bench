@@ -13,11 +13,11 @@ import (
 // This is the baseline the Dapr Redis path is measured against.
 type RedisDirect struct {
 	addr     string
-	workload Workload
+	workload *Workload
 	client   *redis.Client
 }
 
-func NewRedisDirect(addr string, w Workload) *RedisDirect {
+func NewRedisDirect(addr string, w *Workload) *RedisDirect {
 	return &RedisDirect{addr: addr, workload: w}
 }
 
@@ -43,7 +43,7 @@ func (r *RedisDirect) Ops() []Op {
 		{
 			Name: "write",
 			Run: func(ctx context.Context, i int) error {
-				return r.client.Set(ctx, r.workload.Key(i), r.workload.Payload, time.Hour).Err()
+				return r.client.Set(ctx, r.workload.Key(i), r.workload.Payload(), time.Hour).Err()
 			},
 		},
 		{
@@ -68,10 +68,10 @@ func (r *RedisDirect) Close() error {
 type RedisDapr struct {
 	daprBase
 	store    string
-	workload Workload
+	workload *Workload
 }
 
-func NewRedisDapr(grpcPort, store string, w Workload) *RedisDapr {
+func NewRedisDapr(grpcPort, store string, w *Workload) *RedisDapr {
 	return &RedisDapr{daprBase: daprBase{grpcPort: grpcPort}, store: store, workload: w}
 }
 
@@ -84,7 +84,7 @@ func (r *RedisDapr) Ops() []Op {
 		{
 			Name: "write",
 			Run: func(ctx context.Context, i int) error {
-				return r.client.SaveState(ctx, r.store, r.workload.Key(i), r.workload.Payload, nil)
+				return r.client.SaveState(ctx, r.store, r.workload.Key(i), r.workload.Payload(), nil)
 			},
 		},
 		{

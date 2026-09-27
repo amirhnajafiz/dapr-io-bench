@@ -22,12 +22,12 @@ const (
 // NATSDirect publishes with JetStream and waits for the server ack.
 type NATSDirect struct {
 	url      string
-	workload Workload
+	workload *Workload
 	conn     *nats.Conn
 	js       jetstream.JetStream
 }
 
-func NewNATSDirect(url string, w Workload) *NATSDirect {
+func NewNATSDirect(url string, w *Workload) *NATSDirect {
 	return &NATSDirect{url: url, workload: w}
 }
 
@@ -77,7 +77,7 @@ func (n *NATSDirect) Ops() []Op {
 		{
 			Name: "publish",
 			Run: func(ctx context.Context, i int) error {
-				_, err := n.js.Publish(ctx, natsTopicDirect, n.workload.Payload)
+				_, err := n.js.Publish(ctx, natsTopicDirect, n.workload.Payload())
 				return err
 			},
 		},
@@ -97,10 +97,10 @@ func (n *NATSDirect) Close() error {
 type NATSDapr struct {
 	daprBase
 	pubsub   string
-	workload Workload
+	workload *Workload
 }
 
-func NewNATSDapr(grpcPort, pubsub string, w Workload) *NATSDapr {
+func NewNATSDapr(grpcPort, pubsub string, w *Workload) *NATSDapr {
 	return &NATSDapr{daprBase: daprBase{grpcPort: grpcPort}, pubsub: pubsub, workload: w}
 }
 
@@ -113,7 +113,7 @@ func (n *NATSDapr) Ops() []Op {
 		{
 			Name: "publish",
 			Run: func(ctx context.Context, i int) error {
-				return n.client.PublishEvent(ctx, n.pubsub, natsTopicDapr, n.workload.Payload)
+				return n.client.PublishEvent(ctx, n.pubsub, natsTopicDapr, n.workload.Payload())
 			},
 		},
 	}

@@ -64,7 +64,7 @@ services:
 
       # Levels to sweep per dimension. An empty list skips that dimension.
       SWEEP_MODE: "${SWEEP_MODE:-oat}"        # oat = one dimension at a time; grid = every combination
-      SWEEP_RATE: "${SWEEP_RATE-50,200,1000,5000,20000}"
+      SWEEP_RATE: "${SWEEP_RATE-0,50,200,1000,5000,20000,50000,100000}"
       SWEEP_PAYLOAD_BYTES: "${SWEEP_PAYLOAD_BYTES-256,1024,4096,16384}"
       SWEEP_CONCURRENCY: "${SWEEP_CONCURRENCY-1,8,32,128}"
 

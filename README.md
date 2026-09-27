@@ -64,7 +64,7 @@ baseline (`SWEEP_MODE=oat`, one at a time), or measures every combination (`SWEE
 
 | Dimension           | Baseline   | Levels swept (default)   | Meaning                                     |
 | ------------------- | ---------- | ------------------------ | ------------------------------------------- |
-| `RATE`              | 200 ops/s  | `50, 200, 1000, 5000, 20000` | requests per second the callers try to send |
+| `RATE`              | 200 ops/s  | `0, 50, 200, 1000, 5000, 20000, 50000, 100000` | requests per second the callers try to send |
 | `PAYLOAD_BYTES`     | 256 B      | `256, 1024, 4096, 16384` | value size per operation                    |
 | `CONCURRENCY`       | 8 callers  | `1, 8, 32, 128`          | concurrent callers ("agents")               |
 
@@ -98,8 +98,19 @@ call is, stall says how long agents queue behind a saturated path. Because stall
 measured against the schedule rather than the previous call, the results are not subject
 to coordinated omission — a slow connector cannot hide its slowness by sending less.
 
-`RATE=0` is a **closed loop** (each caller fires again as soon as its call returns). Stall is
-not defined there and is reported as zero.
+`RATE=0` is a **closed loop**: each caller fires again as soon as its call returns, so the
+throughput measured is the path's ceiling rather than a target. Stall is not defined there
+and is reported as zero. The default sweep includes one closed-loop point on the RPS axis, so
+every run carries both the paced comparison and each path's capacity.
+
+### Reading throughput
+
+At a fixed target rate, throughput is an input: a path that keeps up delivers exactly the
+target, so both lines sit on the same diagonal and the interesting numbers are latency and
+stall. Throughput only separates the two paths once one of them cannot keep up, which is why
+the rate axis climbs to 100000 and ends with the closed-loop point. Read it as: the RPS at
+which the Dapr line bends away from the diagonal is where the sidecar saturates, and the
+closed-loop point is how much each path can do at all.
 
 ## Traces
 
@@ -135,7 +146,11 @@ make plots FILES="traces/2026*-redis.jsonl"
 For each backend, operation and dimension this writes one SVG into `plots/<backend>/`
 (`write_vs_rps.svg`, `read_vs_payload.svg`, `write_vs_users.svg`, ...) with four panels —
 p50 latency, p99 latency, throughput, error rate — and a direct and a Dapr line in each. Direct
-is always blue, Dapr always orange. Next to the charts, `plots/<backend>/summary.md` tabulates
+is always a solid blue line, Dapr always a dashed orange one, so the two stay tellable where they
+overlap. Throughput against RPS is on a log axis: a path that keeps up with its target is a
+straight diagonal, and one that falls behind bends away from it. The closed-loop point sits in
+its own slot at the right end of the RPS axis, as a lone marker, since it is a ceiling rather
+than a rate. Next to the charts, `plots/<backend>/summary.md` tabulates
 every point with the Dapr-vs-direct ratio, and the same table is printed to stdout. The p95,
 stall and wait numbers are in the trace records for anyone who wants to chart them.
 
@@ -163,9 +178,14 @@ make sweep BACKEND=postgres SWEEP_PAYLOAD_BYTES= SWEEP_CONCURRENCY= \
   SWEEP_RATE=100,500,2000,10000 STEP_DURATION=60s
 ```
 
-The default sweep is 11 points; at two connectors and 40 seconds per step it takes about
-15 minutes per backend. The top rate is there to push the Dapr path past its capacity so
-the stall curves have something to show.
+The default sweep is 14 points; at two connectors and 40 seconds per step it takes about
+19 minutes per backend. The top rates and the closed-loop point are there to push each path
+past its capacity so the throughput and stall curves have something to show.
+
+Runs are additive: the plotter merges every trace it is given, and where two traces measured
+the same point the later one wins. So a run that adds levels to one dimension, for example
+`SWEEP_RATE=0,50000,100000 SWEEP_PAYLOAD_BYTES= SWEEP_CONCURRENCY=`, extends earlier
+traces rather than replacing them.
 
 ### Live view
 

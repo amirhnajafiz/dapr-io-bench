@@ -1,8 +1,12 @@
 COMPOSE := docker compose -f deploy/docker-compose.yml
 
-.PHONY: up down logs build test results results-json plots clean
+# Backend whose direct/Dapr pair `make sweep` compares: nats, postgres or redis.
+BACKEND ?= redis
+export CONNECTORS ?= $(BACKEND)-direct,$(BACKEND)-dapr
 
-## up: build and start the whole stack (backends, bench + sidecar, Prometheus)
+.PHONY: up sweep sweep-all wait down logs build test plots clean
+
+## up: build and start the stack; the bench sweeps $(CONNECTORS) and exits
 up:
 	$(COMPOSE) up --build -d
 	# The sidecar shares the app container's network namespace, which is fixed at
@@ -12,6 +16,21 @@ up:
 	@echo "bench metrics : http://localhost:9100/metrics"
 	@echo "dapr metrics  : http://localhost:9090/metrics"
 	@echo "prometheus    : http://localhost:9091"
+
+## sweep: run one backend's direct-vs-Dapr sweep and follow it, e.g. make sweep BACKEND=nats
+sweep: up
+	$(COMPOSE) logs -f bench
+
+## sweep-all: the three backends back to back, each one its own run and trace file
+sweep-all:
+	@for b in nats postgres redis; do \
+	  $(MAKE) --no-print-directory sweep BACKEND=$$b; \
+	  $(MAKE) --no-print-directory wait; \
+	done
+
+## wait: block until the current bench run has exited
+wait:
+	docker wait $$($(COMPOSE) ps -aq bench)
 
 ## down: stop everything and remove volumes
 down:
@@ -26,14 +45,15 @@ build:
 	go vet ./...
 	go build ./...
 
-## results: print the six results and the Dapr overhead ratio from Prometheus
-results:
-	@./scripts/results.sh
+## test: unit tests for the pacing, stall accounting and sweep planning
+test:
+	go test ./...
 
-## results-json: same capture as JSON, e.g. make results-json > traces/run.json
-results-json:
-	@./scripts/results.sh --json
-
-## plots: chart sampled captures, e.g. make plots FILES="20000.txt 200000.txt"
+## plots: chart every trace, e.g. make plots FILES="traces/*.jsonl"
+FILES ?= traces/*.jsonl
 plots:
 	@./scripts/plot_results.py $(FILES) -o plots
+
+## clean: remove generated charts
+clean:
+	rm -rf plots

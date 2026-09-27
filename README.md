@@ -1,11 +1,11 @@
-# Dapr I/O Benchmark
+# Dapr Bench
 
 [Dapr](https://dapr.io) is an open-source, portable runtime designed to help developers build resilient,
 secure, microservices-based distributed applications and AI agents.
 However, it comes with an I/O overhead caused by the additional layer introduced by Dapr.
-In this work, we run the same workload twice against each of **NATS**, **PostgreSQL**, and **Redis**:
-once through the native Go SDK and once through Dapr. Both results are exported as Prometheus metrics.
-The overhead becomes a measurable ratio, not a guess.
+In this work, we run the same workload against each of **NATS**, **PostgreSQL**, and **Redis**
+twice: once through the native Go SDK and once through Dapr. The load is swept along three
+dimensions, and every step is recorded as a trace, so the overhead becomes a curve, not a guess.
 These results should be taken into consideration when deciding whether to switch to Dapr.
 
 > As Gamora asked Thanos: **“What did it cost?”**
@@ -22,9 +22,10 @@ These results should be taken into consideration when deciding whether to switch
 | `redis-direct`    | app → go-redis → Redis              | `write`, `read` |
 | `redis-dapr`      | app → gRPC → daprd → Redis          | `write`, `read` |
 
-Each pair hits the **same server instance** with the **same payload** at the **same
-rate**, and all six run **concurrently**, so they share one machine's CPU and IO
-weather, and the only difference within a pair is the sidecar hop.
+A run compares **one pair** — a backend's direct and Dapr connectors — and never more than
+two connectors. Within a run the two are measured **one at a time**, never concurrently, so
+the backend and the sidecar only ever serve the connector being measured. The only difference
+within a pair is the sidecar hop.
 
 ```mermaid
 flowchart LR
@@ -46,137 +47,152 @@ flowchart LR
 ## Quick start
 
 ```sh
-make up        # build + start backends, bench app, sidecar, Prometheus
-make logs      # follow the run
-make results   # print all six results and the overhead ratios
-make down      # tear everything down
+make sweep BACKEND=redis     # build + start the stack, sweep redis-direct vs redis-dapr, follow the log
+make sweep-all               # nats, postgres, redis back to back, one trace file each
+make plots                   # charts + summary tables from traces/*.jsonl into plots/
+make down                    # tear everything down
 ```
 
-Then: bench metrics on <http://localhost:9100/metrics>, the sidecar's own metrics on
-<http://localhost:9090/metrics>, Prometheus on <http://localhost:9091>.
+A sweep writes `traces/<timestamp>-<backend>.jsonl` and exits. While it runs, bench metrics are
+on <http://localhost:9100/metrics>, the sidecar's on <http://localhost:9090/metrics>, and
+Prometheus on <http://localhost:9091>.
 
-## Results
+## How a sweep works
 
-**Dapr's cost depends entirely on which regime you are in.** Under light load it is a
-fixed sub-millisecond tax. Under saturation it becomes a ceiling on throughput.
+Load has three dimensions, and the sweep varies each one while holding the other two at a
+baseline (`SWEEP_MODE=oat`, one at a time), or measures every combination (`SWEEP_MODE=grid`):
 
-| Regime                                        | Latency cost             | Throughput cost             |
-| --------------------------------------------- | ------------------------ | --------------------------- |
-| **Light** — 200 ops/sec, 256 B, concurrency 8 | `+0.2–0.7 ms` (1.8–3.1×) | not saturated               |
-| **Saturated** — 10 KiB, concurrency 1000      | 1.9–4.5× at p50          | **2.1–4.1× less work done** |
+| Dimension           | Baseline   | Levels swept (default)   | Meaning                                     |
+| ------------------- | ---------- | ------------------------ | ------------------------------------------- |
+| `RATE`              | 200 ops/s  | `50, 200, 1000, 5000, 20000` | requests per second the callers try to send |
+| `PAYLOAD_BYTES`     | 256 B      | `256, 1024, 4096, 16384` | value size per operation                    |
+| `CONCURRENCY`       | 8 callers  | `1, 8, 32, 128`          | concurrent callers ("agents")               |
 
-### Throughput is the real story
+For every point the sweep, in order:
 
-![Throughput, direct vs Dapr](plots/throughput.svg)
+1. sets the payload size, then for each connector of the pair:
+2. **seeds** the keyspace through the connector's `write` op, so a `read` never misses;
+3. runs a **warmup** (`STEP_WARMUP`, discarded);
+4. **measures** for `STEP_DURATION`, then rests for `STEP_COOLDOWN` before the next connector.
 
-At saturation the sidecar caps how much work gets through, regardless of how hard the
-app pushes (`RATE=200000`, 10 KiB payloads):
+Operations of a connector alternate (`write`, `read`, `write`, ...) and each is timed on its
+own, so a connector with two ops reports two records per point.
 
-| Operation        |       Direct | Through Dapr |       Penalty |
-| ---------------- | -----------: | -----------: | ------------: |
-| `nats publish`   | 42,452 ops/s | 10,280 ops/s | **4.1× less** |
-| `postgres read`  |  9,308 ops/s |  2,404 ops/s | **3.9× less** |
-| `postgres write` |  9,307 ops/s |  2,404 ops/s | **3.9× less** |
-| `redis read`     | 16,592 ops/s |  7,957 ops/s |     2.1× less |
-| `redis write`    | 16,592 ops/s |  7,956 ops/s |     2.1× less |
+### Open-loop load and stall time
 
-### Latency
+With a `RATE`, the load is **open loop**: operation *k* is due at `start + k / RATE` whether or
+not the previous ones have returned, exactly as a fleet of agents keeps arriving regardless of
+how the backend is doing. Each caller takes the next due operation; if it is already overdue,
+the overdue time is recorded as **stall** — the queueing delay the caller sat through before
+the call could even begin.
 
-![p50 latency, direct vs Dapr](plots/p50_latency.svg)
+| Measure     | What the timer brackets                                             |
+| ----------- | ------------------------------------------------------------------- |
+| **latency** | the call itself, from send to return                                |
+| **stall**   | from the moment the operation was due to the moment the call began  |
+| **wait**    | stall + latency: what an agent experiences, from wanting to done    |
 
-> [!NOTE]
-> **The sidecar was already saturated at the lower rate.** Between the two runs, Dapr's
-> NATS p50 barely moved — `93.4 ms → 94.0 ms` — while the direct path went
-> `4.6 ms → 21.4 ms`. Dapr had hit its ceiling in *both* runs; the direct path only
-> started to feel the load in the second.
->
-> This is why the raw ratio misleads. That same pairing reads as **20.3×** at
-> `RATE=20000` and **4.4×** at `RATE=200000` — not because Dapr got faster, but
-> because the baseline it is divided by got slower. Quote the absolute numbers.
+Stall is zero while a connector keeps up with the target rate, and grows for the whole
+window once it cannot. That is the number for agentic workloads: latency says how fast a
+call is, stall says how long agents queue behind a saturated path. Because stall is
+measured against the schedule rather than the previous call, the results are not subject
+to coordinated omission — a slow connector cannot hide its slowness by sending less.
 
-Under light load the picture is far less dramatic: Dapr adds **0.2–0.7 ms** per
-operation, which for most applications is noise against a network round trip.
+`RATE=0` is a **closed loop** (each caller fires again as soon as its call returns). Stall is
+not defined there and is reported as zero.
 
-## Reading the metrics
+## Traces
 
-Raw series, all labelled `backend` / `mode` / `op`:
+Every step is one JSON line in `traces/<sweep>.jsonl`, after a header line describing the
+plan. A record carries the point, the connector, and every measurement:
 
-| Metric                      | Meaning                                                       |
-| --------------------------- | ------------------------------------------------------------- |
-| `bench_op_duration_seconds` | per-operation latency histogram                               |
-| `bench_ops_total`           | attempts, also labelled `status`                              |
-| `bench_connector_up`        | `1` per connector that started — a `0` means a missing result |
-| `bench_config_info`         | the run's settings as labels, so a capture is self-describing  |
-
-Because `mode` is the *only* differing label within a pair, the overhead is a plain
-division. The derived views live in [rules.yml](deploy/prometheus/rules.yml):
-
-```promql
-bench:latency_p50   bench:latency_p95   bench:latency_p99   # per connector
-bench:throughput                                            # successful ops/sec
-bench:dapr_overhead_ratio_p50                               # ×  slower than direct
-bench:dapr_overhead_seconds_p50                             # +  seconds vs direct
+```json
+{"type":"step","sweep":"20260927T101500Z-redis","captured_at":"2026-09-27T10:16:22Z",
+ "dimension":"rate","rate":1000,"payload_bytes":256,"concurrency":8,"keyspace":1000,
+ "connector":"redis-dapr","backend":"redis","mode":"dapr","op":"write",
+ "paced":true,"elapsed_seconds":30.0,"achieved_rate":998.7,
+ "ops":14981,"errors":0,"timeouts":0,"throughput":499.4,
+ "latency":{"p50":0.00071,"p95":0.00112,"p99":0.00164,"mean":0.00075,"max":0.0121},
+ "stall":{"p50":0.00002,"p95":0.00009,"p99":0.00031,"mean":0.00003,"max":0.0018},
+ "wait":{"p50":0.00073,"p95":0.00119,"p99":0.00181,"mean":0.00078,"max":0.0126}}
 ```
 
-### Plotting sampled runs
+Times are seconds. A record whose `errors` is non-zero also carries `first_error`, the message
+of the first failure, so an error count is never a mystery. `throughput` counts successful
+operations per second of the measured window; `achieved_rate` is what the connector actually issued across all its ops, against the
+target `rate`. `dimension` says which axis the point belongs to (`baseline` is the point
+shared by all three curves in one-at-a-time mode). Percentiles come from a log-linear
+histogram with 1% resolution, computed in the app from every operation of the step, not
+sampled from a scrape.
 
-Capture a run, then plot any number of captures against each other:
+### Plotting
 
 ```sh
-make results      > traces/20000.txt    # text capture, run info at the top
-make results-json > traces/20000.json   # same run, machine-readable
-make plots FILES="traces/*.txt"         # .txt or .json, or a mix of both
+make plots                              # every trace
+make plots FILES="traces/2026*-redis.jsonl"
 ```
 
-Every capture opens with the settings that produced it, read from the
-`bench_config_info` metric the app publishes — not from the compose file, which
-may have changed since:
+For each backend, operation and dimension this writes one SVG into `plots/<backend>/`
+(`write_vs_rps.svg`, `read_vs_payload.svg`, `write_vs_users.svg`, ...) with four panels —
+p50 latency, p99 latency, throughput, error rate — and a direct and a Dapr line in each. Direct
+is always blue, Dapr always orange. Next to the charts, `plots/<backend>/summary.md` tabulates
+every point with the Dapr-vs-direct ratio, and the same table is printed to stdout. The p95,
+stall and wait numbers are in the trace records for anyone who wants to chart them.
 
-```
-=== run info ===
-  captured        2026-09-13T22:02:58+00:00
-  payload_bytes   10240
-  keyspace        1000
-  concurrency     1000
-  rate            200000
-  warmup          10s
-  duration        10m0s
-  connectors up   6/6
-```
-
-`make results-json` emits the same run as JSON — `config`, `connectors_up`, and a
-`results` block per recorded rule — for diffing runs or feeding another tool.
-
-This writes one SVG per metric into `plots/` — a panel per capture on a shared scale —
-and prints the direct-vs-Dapr ratios to stdout. Direct is always blue, Dapr always
-orange. It is **standard-library Python only**: no matplotlib, no virtualenv.
-
-A percentile absent from a capture is not plotted, and the script says which it
-skipped rather than drawing an empty panel.
+It is **standard-library Python only**: no matplotlib, no virtualenv. If two traces cover the
+same point, the later capture wins.
 
 ## Configuration
 
 All knobs are environment variables on the `bench` service in
-[docker-compose.yml](deploy/docker-compose.yml):
+[docker-compose.yml](deploy/docker-compose.yml); each can be overridden on the `make` line.
 
-| Variable        | Meaning                                                  |
-| --------------- | -------------------------------------------------------- |
-| `PAYLOAD_BYTES` | value size per operation                                 |
-| `KEYSPACE`      | distinct keys cycled through                             |
-| `CONCURRENCY`   | in-flight operations per connector                       |
-| `RATE`          | operations/sec per connector (`0` = as fast as possible) |
-| `WARMUP`        | discarded settling period                                |
-| `DURATION`      | run length (`0` = until stopped)                         |
+| Variable                                     | Meaning                                                          |
+| -------------------------------------------- | ---------------------------------------------------------------- |
+| `CONNECTORS`                                 | the pair to compare, e.g. `nats-direct,nats-dapr` (at most two)  |
+| `RATE`, `PAYLOAD_BYTES`, `CONCURRENCY`       | the baseline point                                               |
+| `SWEEP_RATE`, `SWEEP_PAYLOAD_BYTES`, `SWEEP_CONCURRENCY` | levels per dimension; set a list empty to skip that dimension |
+| `SWEEP_MODE`                                 | `oat` (default) or `grid`                                        |
+| `KEYSPACE`                                   | distinct keys cycled through                                     |
+| `STEP_WARMUP`, `STEP_DURATION`, `STEP_COOLDOWN` | per connector per point: discarded, measured, idle             |
+| `OP_TIMEOUT`                                 | per-operation deadline; a hit counts as an error and a timeout   |
 
-Payload size is the interesting axis: Dapr's cost is largely per-call, so the relative
-overhead shrinks as payloads grow. Concurrency is the other one — it decides which of
-the two regimes above you are measuring.
+```sh
+# a longer, narrower experiment: only the rate axis, one minute per step
+make sweep BACKEND=postgres SWEEP_PAYLOAD_BYTES= SWEEP_CONCURRENCY= \
+  SWEEP_RATE=100,500,2000,10000 STEP_DURATION=60s
+```
+
+The default sweep is 11 points; at two connectors and 40 seconds per step it takes about
+15 minutes per backend. The top rate is there to push the Dapr path past its capacity so
+the stall curves have something to show.
+
+### Live view
+
+The app also exports Prometheus metrics for watching a step as it happens:
+
+| Metric                      | Meaning                                                      |
+| --------------------------- | ------------------------------------------------------------ |
+| `bench_op_duration_seconds` | latency histogram, labelled `backend` / `mode` / `op`        |
+| `bench_op_stall_seconds`    | stall histogram, same labels                                 |
+| `bench_ops_total`           | attempts, also labelled `status`                             |
+| `bench_step_info`           | the point being measured right now, as labels                |
+| `bench_connector_up`        | `1` per connector that connected                             |
+
+[rules.yml](deploy/prometheus/rules.yml) records `bench:latency_p50/p95/p99`,
+`bench:stall_p50/p99` and `bench:throughput`. These are a window into the run, not its record;
+the trace file is the record.
 
 ## Fairness notes
 
-Benchmarks like this are easy to rig by accident. Each of these is enforced by the code
-and verified against a live run:
+Benchmarks like this are easy to rig by accident. Each of these is enforced by the code:
 
+- **One connector at a time.** The pair never shares the backend or the sidecar while being
+  measured, and a cooldown separates them so one step's tail never bleeds into the next.
+- **Open-loop pacing against a schedule**, so a slow path cannot lower its own load; the
+  time it falls behind is measured as stall rather than lost.
+- **The keyspace is seeded before every step**, through the connector under test, so reads
+  never miss and the first seconds are not a cold-start artefact.
 - **NATS publishes wait for the JetStream ack on both sides.** Dapr's component calls
   the synchronous `jsc.Publish`, and so does the direct connector. Comparing against a
   fire-and-forget core NATS publish would measure buffering, not overhead.
@@ -187,7 +203,7 @@ and verified against a live run:
 - **App and sidecar share a network namespace**, exactly like a Kubernetes pod, so the
   gRPC hop is loopback rather than a Docker bridge.
 - **Warmup measurements are discarded**, so cold pools do not skew the first seconds.
-- **Identical payload, keyspace, rate and concurrency** across all six connectors.
+- **Identical payload, keyspace, rate and concurrency** for both connectors at every point.
 
 ### What the sidecar hop does *not* explain
 
@@ -210,10 +226,13 @@ sidecar hop buys those things; this project only prices it.
 ## Layout
 
 ```
-cmd/bench/            entrypoint: wires the six connectors and runs them
+cmd/bench/            entrypoint: builds the pair, connects, runs the sweep
 internal/connector/   one file per backend, holding both its direct and Dapr client
-internal/runner/      the shared workload driver
-internal/metrics/     Prometheus exporter
+internal/runner/      one measured step: open-loop pacing, stall accounting
+internal/sweep/       the load schedule and the trace writer
+internal/stats/       log-linear histogram behind the percentiles
+internal/metrics/     Prometheus exporter for the live view
 deploy/               compose stack, Dapr components, Prometheus config + rules
-scripts/              results summariser and the SVG plotter
+scripts/              the SVG plotter and summary table
+traces/               one .jsonl per sweep
 ```

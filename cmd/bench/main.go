@@ -6,97 +6,70 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/amirtkz/dapr-overhead-bench/internal/config"
 	"github.com/amirtkz/dapr-overhead-bench/internal/connector"
 	"github.com/amirtkz/dapr-overhead-bench/internal/metrics"
-	"github.com/amirtkz/dapr-overhead-bench/internal/runner"
+	"github.com/amirtkz/dapr-overhead-bench/internal/sweep"
 )
 
-func initVars() {
+func init() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("[cmd-bench] ")
 }
 
 func main() {
-	// load configs
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
 
-	// build a new workload instance
-	workload := connector.NewWorkload(cfg.PayloadBytes, cfg.Keyspace)
+	// one workload for every connector: the sweep resizes its payload per step
+	workload := connector.NewWorkload(cfg.Plan.Baseline.PayloadBytes, cfg.Plan.Keyspace)
 
-	// stop handlers ends the run cleanly, letting connectors close
+	// a signal ends the sweep cleanly, letting connectors close and the trace
+	// file keep every step completed so far
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if cfg.Duration > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cfg.Duration)
-		defer cancel()
-	}
 
 	// the exporter comes up before any connecting happens, so Prometheus can
 	// scrape bench_connector_up even when a backend is unreachable
-	// Published before the run starts, so a scrape taken at any point carries the
-	// settings that produced it.
-	metrics.Config.WithLabelValues(
-		strconv.Itoa(cfg.PayloadBytes),
-		strconv.Itoa(cfg.Keyspace),
-		strconv.Itoa(cfg.Concurrency),
-		strconv.Itoa(cfg.Rate),
-		cfg.Warmup.String(),
-		cfg.Duration.String(),
-	).Set(1)
-
 	go func() {
 		log.Printf("metrics exporter listening on %s/metrics", cfg.MetricsAddr)
-
 		if err := metrics.Serve(cfg.MetricsAddr); err != nil {
 			log.Fatalf("metrics exporter stopped: %v", err)
 		}
 	}()
 
-	// data paths under comparison, paired backend by backend
-	candidates := []connector.Connector{
-		connector.NewNATSDirect(cfg.NATSURL, workload),
-		connector.NewNATSDapr(cfg.DaprGRPCPort, cfg.DaprPubsubNATS, workload),
-		connector.NewPostgresDirect(cfg.PostgresDSN, workload),
-		connector.NewPostgresDapr(cfg.DaprGRPCPort, cfg.DaprStatePG, workload),
-		connector.NewRedisDirect(cfg.RedisAddr, workload),
-		connector.NewRedisDapr(cfg.DaprGRPCPort, cfg.DaprStateRedis, workload),
+	var candidates []connector.Connector
+	for _, name := range cfg.Connectors {
+		c, err := connector.New(name, cfg.Endpoints, workload)
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		candidates = append(candidates, c)
 	}
 
-	// connect candidates
 	connected := connect(ctx, candidates)
 	if len(connected) == 0 {
 		log.Fatal("no connector could be established; check the backing services")
 	}
 	defer func() {
 		for _, c := range connected {
-			// close connection when terminated
 			if err := c.Close(); err != nil {
 				log.Printf("close %s: %v", connector.Name(c), err)
 			}
 		}
 	}()
 
-	// create a runner instance and execute workloads
-	runner.Run(ctx, connected, runner.Options{
-		Concurrency: cfg.Concurrency,
-		Rate:        cfg.Rate,
-		Warmup:      cfg.Warmup,
-		OpTimeout:   5 * time.Second,
-	})
-
-	log.Print("run finished; metrics remain available until the process exits")
-
-	// hold the exporter open briefly so a final scrape can pick up the results
-	// of a fixed-duration run before the container disappears
-	if cfg.Duration > 0 {
-		time.Sleep(30 * time.Second)
+	path, err := sweep.Run(ctx, connected, workload, cfg.Plan, cfg.ResultsDir)
+	if err != nil {
+		log.Printf("sweep stopped early: %v (steps completed so far are in %s)", err, path)
+		return
 	}
+	log.Printf("sweep finished; trace written to %s", path)
 }
 
 // connect brings up each connector, retrying to absorb the slow start of the

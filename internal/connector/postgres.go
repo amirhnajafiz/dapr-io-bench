@@ -52,24 +52,43 @@ func (p *PostgresDirect) Connect(ctx context.Context) error {
 	return p.pool.Ping(ctx)
 }
 
+const pgUpsert = `INSERT INTO bench_kv (key, value) VALUES ($1, $2)
+	ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`
+
+func (p *PostgresDirect) Seed(ctx context.Context, keyspace int) error {
+	for i := 0; i < keyspace; i++ {
+		if _, err := p.pool.Exec(ctx, pgUpsert, p.workload.Key(i), p.workload.Payload()); err != nil {
+			return fmt.Errorf("seed key %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 func (p *PostgresDirect) Ops() []Op {
 	return []Op{
 		{
-			Name: "write",
+			Name: OpWrite,
 			Run: func(ctx context.Context, i int) error {
-				_, err := p.pool.Exec(ctx,
-					`INSERT INTO bench_kv (key, value) VALUES ($1, $2)
-				 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-					p.workload.Key(i), p.workload.Payload())
+				_, err := p.pool.Exec(ctx, pgUpsert, p.workload.Key(i), p.workload.Payload())
 				return err
 			},
 		},
 		{
-			Name: "read",
+			Name: OpRead,
 			Run: func(ctx context.Context, i int) error {
 				var value []byte
 				return p.pool.QueryRow(ctx,
 					`SELECT value FROM bench_kv WHERE key = $1`, p.workload.Key(i)).Scan(&value)
+			},
+		},
+		{
+			// an index-only existence check: the row is found, the value is
+			// never read off disk
+			Name: OpStat,
+			Run: func(ctx context.Context, i int) error {
+				var one int
+				return p.pool.QueryRow(ctx,
+					`SELECT 1 FROM bench_kv WHERE key = $1`, p.workload.Key(i)).Scan(&one)
 			},
 		},
 	}
@@ -99,20 +118,8 @@ func (p *PostgresDapr) Backend() string { return BackendPostgres }
 
 func (p *PostgresDapr) Connect(ctx context.Context) error { return p.connect(ctx) }
 
-func (p *PostgresDapr) Ops() []Op {
-	return []Op{
-		{
-			Name: "write",
-			Run: func(ctx context.Context, i int) error {
-				return p.client.SaveState(ctx, p.store, p.workload.Key(i), p.workload.Payload(), nil)
-			},
-		},
-		{
-			Name: "read",
-			Run: func(ctx context.Context, i int) error {
-				_, err := p.client.GetState(ctx, p.store, p.workload.Key(i), nil)
-				return err
-			},
-		},
-	}
+func (p *PostgresDapr) Seed(ctx context.Context, keyspace int) error {
+	return p.seedState(ctx, p.store, p.workload, keyspace)
 }
+
+func (p *PostgresDapr) Ops() []Op { return p.stateOps(p.store, p.workload) }

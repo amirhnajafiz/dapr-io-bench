@@ -13,11 +13,13 @@ type Endpoints struct {
 	NATSURL     string
 	RedisAddr   string
 	PostgresDSN string
+	FSDir       string // directory the direct filesystem connector writes to
 
 	DaprGRPCPort   string
 	DaprPubsubNATS string
 	DaprStateRedis string
 	DaprStatePG    string
+	DaprBindingFS  string
 }
 
 type factory func(e Endpoints, w *Workload) Connector
@@ -29,6 +31,8 @@ var registry = map[string]factory{
 	BackendPostgres + "-" + ModeDapr:   func(e Endpoints, w *Workload) Connector { return NewPostgresDapr(e.DaprGRPCPort, e.DaprStatePG, w) },
 	BackendRedis + "-" + ModeDirect:    func(e Endpoints, w *Workload) Connector { return NewRedisDirect(e.RedisAddr, w) },
 	BackendRedis + "-" + ModeDapr:      func(e Endpoints, w *Workload) Connector { return NewRedisDapr(e.DaprGRPCPort, e.DaprStateRedis, w) },
+	BackendFS + "-" + ModeDirect:       func(e Endpoints, w *Workload) Connector { return NewFSDirect(e.FSDir, w) },
+	BackendFS + "-" + ModeDapr:         func(e Endpoints, w *Workload) Connector { return NewFSDapr(e.DaprGRPCPort, e.DaprBindingFS, w) },
 }
 
 // Names lists every connector this binary knows, sorted.

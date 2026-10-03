@@ -38,18 +38,33 @@ func (r *RedisDirect) Connect(ctx context.Context) error {
 	return nil
 }
 
+func (r *RedisDirect) Seed(ctx context.Context, keyspace int) error {
+	for i := 0; i < keyspace; i++ {
+		if err := r.client.Set(ctx, r.workload.Key(i), r.workload.Payload(), time.Hour).Err(); err != nil {
+			return fmt.Errorf("seed key %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 func (r *RedisDirect) Ops() []Op {
 	return []Op{
 		{
-			Name: "write",
+			Name: OpWrite,
 			Run: func(ctx context.Context, i int) error {
 				return r.client.Set(ctx, r.workload.Key(i), r.workload.Payload(), time.Hour).Err()
 			},
 		},
 		{
-			Name: "read",
+			Name: OpRead,
 			Run: func(ctx context.Context, i int) error {
 				return r.client.Get(ctx, r.workload.Key(i)).Err()
+			},
+		},
+		{
+			Name: OpStat,
+			Run: func(ctx context.Context, i int) error {
+				return r.client.Exists(ctx, r.workload.Key(i)).Err()
 			},
 		},
 	}
@@ -63,8 +78,8 @@ func (r *RedisDirect) Close() error {
 	return nil
 }
 
-// RedisDapr performs the same get/set against the same Redis instance, but via
-// the Dapr state store API.
+// RedisDapr performs the same operations against the same Redis instance, but
+// via the Dapr state store API.
 type RedisDapr struct {
 	daprBase
 	store    string
@@ -79,20 +94,8 @@ func (r *RedisDapr) Backend() string { return BackendRedis }
 
 func (r *RedisDapr) Connect(ctx context.Context) error { return r.connect(ctx) }
 
-func (r *RedisDapr) Ops() []Op {
-	return []Op{
-		{
-			Name: "write",
-			Run: func(ctx context.Context, i int) error {
-				return r.client.SaveState(ctx, r.store, r.workload.Key(i), r.workload.Payload(), nil)
-			},
-		},
-		{
-			Name: "read",
-			Run: func(ctx context.Context, i int) error {
-				_, err := r.client.GetState(ctx, r.store, r.workload.Key(i), nil)
-				return err
-			},
-		},
-	}
+func (r *RedisDapr) Seed(ctx context.Context, keyspace int) error {
+	return r.seedState(ctx, r.store, r.workload, keyspace)
 }
+
+func (r *RedisDapr) Ops() []Op { return r.stateOps(r.store, r.workload) }

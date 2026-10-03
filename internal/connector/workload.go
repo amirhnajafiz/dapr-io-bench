@@ -10,22 +10,22 @@ import (
 // instance guarantees that the only variable between two results is the data
 // path, never the amount of data moved.
 //
-// The payload is swappable because a sweep changes its size between steps;
-// the swap is atomic so a step that is still draining never sees a torn value.
+// Both are swappable because a sweep changes the payload size between steps
+// and shrinks the keyspace to keep the dataset bounded when values get large;
+// the swaps are atomic so a step that is still draining never sees a torn value.
 type Workload struct {
 	payload  atomic.Pointer[[]byte]
-	Keyspace int // keys are cycled modulo this, keeping the dataset bounded
+	keyspace atomic.Int64
 }
+
+// Marker is the one-byte value behind every stat key on the Dapr side.
+var Marker = []byte{'1'}
 
 // NewWorkload builds a workload with a payload of the requested size.
 func NewWorkload(payloadBytes, keyspace int) *Workload {
-	if keyspace < 1 {
-		keyspace = 1
-	}
-
-	w := &Workload{Keyspace: keyspace}
+	w := &Workload{}
 	w.SetPayloadBytes(payloadBytes)
-
+	w.SetKeyspace(keyspace)
 	return w
 }
 
@@ -37,21 +37,41 @@ func (w *Workload) SetPayloadBytes(n int) {
 
 	payload := make([]byte, n)
 	for i := range payload {
-		// non-zero, non-uniform bytes so compression in any layer cannot
-		// flatter one backend over another
-		payload[i] = byte('a' + i%26)
+		// printable, non-uniform bytes so compression in any layer cannot
+		// flatter one backend over another. The range includes characters
+		// outside the base64 alphabet on purpose: Dapr's localstorage binding
+		// base64-decodes any data that happens to decode, which would silently
+		// shrink an all-letters payload by a quarter.
+		payload[i] = byte(33 + i%94)
 	}
 
 	w.payload.Store(&payload)
 }
 
-// Payload is the value written on every operation.
+// SetKeyspace sets how many distinct keys the connectors cycle through.
+func (w *Workload) SetKeyspace(n int) {
+	if n < 1 {
+		n = 1
+	}
+	w.keyspace.Store(int64(n))
+}
+
+// Payload is the value written on every heavy operation.
 func (w *Workload) Payload() []byte { return *w.payload.Load() }
 
 // PayloadBytes is the current payload size.
 func (w *Workload) PayloadBytes() int { return len(w.Payload()) }
 
+// Keyspace is the current number of distinct keys.
+func (w *Workload) Keyspace() int { return int(w.keyspace.Load()) }
+
 // Key maps an iteration number onto the bounded keyspace.
 func (w *Workload) Key(i int) string {
-	return fmt.Sprintf("bench-key-%d", i%w.Keyspace)
+	return fmt.Sprintf("bench-key-%d", i%w.Keyspace())
+}
+
+// MarkerKey is the stat key for an iteration: a separate, tiny record that
+// exists so a metadata-style call never has to move the payload.
+func (w *Workload) MarkerKey(i int) string {
+	return fmt.Sprintf("bench-meta-%d", i%w.Keyspace())
 }

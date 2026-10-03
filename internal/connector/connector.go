@@ -14,6 +14,17 @@ const (
 	BackendNATS     = "nats"
 	BackendPostgres = "postgres"
 	BackendRedis    = "redis"
+	BackendFS       = "fs"
+)
+
+// Operation names shared by the connectors. Heavy ops carry the payload;
+// stat is the lightest call that touches a key without moving data, so the
+// two classes separate per-call overhead from the cost of moving bytes.
+const (
+	OpWrite   = "write"
+	OpRead    = "read"
+	OpStat    = "stat"
+	OpPublish = "publish"
 )
 
 // Op is a single named operation a connector can perform, e.g. "write".
@@ -24,18 +35,19 @@ type Op struct {
 	Run  func(ctx context.Context, i int) error
 }
 
-// Connector is one of the six benchmarked data paths.
+// Connector is one of the benchmarked data paths.
 //
-// Ops are independent of each other: the sweep seeds every key through the
-// "write" op before measuring, so a "read" never depends on the write that
-// happened to precede it.
+// Ops are independent of each other: the sweep calls Seed before measuring,
+// so a "read" or "stat" never depends on the write that happened to precede it.
 type Connector interface {
-	// Backend reports which backing service is exercised (nats/postgres/redis).
+	// Backend reports which backing service is exercised (nats/postgres/redis/fs).
 	Backend() string
 	// Mode reports whether the path goes through Dapr (direct/dapr).
 	Mode() string
 	// Connect establishes the client and prepares any schema or streams.
 	Connect(ctx context.Context) error
+	// Seed writes every key of the keyspace once, so later reads never miss.
+	Seed(ctx context.Context, keyspace int) error
 	// Ops returns the operations to benchmark.
 	Ops() []Op
 	// Close releases the client.

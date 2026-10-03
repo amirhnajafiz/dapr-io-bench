@@ -18,55 +18,70 @@ import (
 	"github.com/amirtkz/dapr-overhead-bench/internal/stats"
 )
 
-// Dimensions a sweep can vary. "baseline" tags the point where every
-// dimension sits at its baseline value; in one-at-a-time mode that point is
-// shared by all three curves and measured once.
+// Dimensions a sweep can vary. "baseline" tags the point where both sit at
+// their baseline value; in one-at-a-time mode that point is shared by both
+// curves and measured once.
 const (
-	DimBaseline    = "baseline"
-	DimRate        = "rate"
-	DimPayload     = "payload_bytes"
-	DimConcurrency = "concurrency"
-	DimGrid        = "grid"
+	DimBaseline = "baseline"
+	DimAgents   = "agents"
+	DimPayload  = "payload_bytes"
+	DimGrid     = "grid"
 )
 
 // Sweep modes.
 const (
-	ModeOneAtATime = "oat"  // vary one dimension, hold the other two at baseline
-	ModeGrid       = "grid" // every combination of the three lists
+	ModeOneAtATime = "oat"  // vary one dimension, hold the other at its profile value
+	ModeGrid       = "grid" // every combination of the two lists
 )
 
-// Point is one load setting: the three dimensions and which one it varies.
+// Point is one load setting: how many agents share the tasks and how large
+// each value is. Dimension says which curve the point belongs to; a point on
+// two curves carries both names, comma-separated.
 type Point struct {
 	Dimension    string `json:"dimension"`
-	Rate         int    `json:"rate"`
+	Agents       int    `json:"agents"`
 	PayloadBytes int    `json:"payload_bytes"`
-	Concurrency  int    `json:"concurrency"`
 }
 
 // Plan is the load schedule of a sweep.
+//
+// The two dimensions have their own load profiles rather than one shared
+// baseline: large payloads are moved by few agents and many agents move the
+// baseline payload, so a sweep finds where storage falls behind on each axis
+// without paying for the combinations that would only exhaust memory.
 type Plan struct {
-	Mode          string `json:"mode"`
-	Baseline      Point  `json:"baseline"`
-	Rates         []int  `json:"rates"`
-	PayloadBytes  []int  `json:"payload_bytes"`
-	Concurrencies []int  `json:"concurrencies"`
+	Mode         string `json:"mode"`
+	Baseline     Point  `json:"baseline"`
+	Agents       []int  `json:"agents"`
+	PayloadBytes []int  `json:"payload_bytes"`
 
-	Keyspace  int           `json:"keyspace"`
-	Warmup    time.Duration `json:"-"`
-	Duration  time.Duration `json:"-"`
-	Cooldown  time.Duration `json:"-"`
-	OpTimeout time.Duration `json:"-"`
+	// Agents driving the payload sweep (the agents sweep uses the baseline payload).
+	PayloadSweepAgents int `json:"payload_sweep_agents"`
+
+	// Tasks is the number of operations per step at small payloads. It shrinks
+	// as payloads grow so a step never moves more than MaxTaskBytes, and it is
+	// never fewer than the agents, so every agent gets at least one task.
+	Tasks        int   `json:"tasks"`
+	MaxTaskBytes int64 `json:"max_task_bytes"`
+	WarmupTasks  int   `json:"warmup_tasks"`
+
+	// Keyspace is the number of distinct keys at small payloads. It shrinks
+	// as payloads grow so the seeded dataset never exceeds MaxDatasetBytes.
+	Keyspace        int   `json:"keyspace"`
+	MaxDatasetBytes int64 `json:"max_dataset_bytes"`
+
+	Cooldown    time.Duration `json:"-"`
+	OpTimeout   time.Duration `json:"-"`
+	StepTimeout time.Duration `json:"-"`
 }
 
 // Points expands the plan into the ordered list of settings to measure.
 func (p Plan) Points() []Point {
 	if p.Mode == ModeGrid {
 		var pts []Point
-		for _, r := range orDefault(p.Rates, p.Baseline.Rate) {
+		for _, a := range orDefault(p.Agents, p.Baseline.Agents) {
 			for _, b := range orDefault(p.PayloadBytes, p.Baseline.PayloadBytes) {
-				for _, c := range orDefault(p.Concurrencies, p.Baseline.Concurrency) {
-					pts = append(pts, Point{DimGrid, r, b, c})
-				}
+				pts = append(pts, Point{DimGrid, a, b})
 			}
 		}
 		return pts
@@ -75,22 +90,30 @@ func (p Plan) Points() []Point {
 	base := p.Baseline
 	base.Dimension = DimBaseline
 	pts := []Point{base}
-	for _, r := range p.Rates {
-		if r != base.Rate {
-			pts = append(pts, Point{DimRate, r, base.PayloadBytes, base.Concurrency})
+	// a load that belongs to both dimensions is measured once and tagged with
+	// both, comma-separated, so each curve still has its point
+	add := func(pt Point) {
+		for i := range pts {
+			if pts[i].sameLoad(pt) {
+				if pts[i].Dimension != DimBaseline {
+					pts[i].Dimension += "," + pt.Dimension
+				}
+				return
+			}
 		}
+		pts = append(pts, pt)
 	}
 	for _, b := range p.PayloadBytes {
-		if b != base.PayloadBytes {
-			pts = append(pts, Point{DimPayload, base.Rate, b, base.Concurrency})
-		}
+		add(Point{DimPayload, p.PayloadSweepAgents, b})
 	}
-	for _, c := range p.Concurrencies {
-		if c != base.Concurrency {
-			pts = append(pts, Point{DimConcurrency, base.Rate, base.PayloadBytes, c})
-		}
+	for _, a := range p.Agents {
+		add(Point{DimAgents, a, base.PayloadBytes})
 	}
 	return pts
+}
+
+func (pt Point) sameLoad(o Point) bool {
+	return pt.Agents == o.Agents && pt.PayloadBytes == o.PayloadBytes
 }
 
 func orDefault(list []int, fallback int) []int {
@@ -100,19 +123,40 @@ func orDefault(list []int, fallback int) []int {
 	return list
 }
 
+// KeyspaceFor shrinks the keyspace as the payload grows, so the seeded
+// dataset stays under MaxDatasetBytes: 1000 keys at 256 B, but a single key
+// at a gigabyte.
+func (p Plan) KeyspaceFor(payloadBytes int) int {
+	if p.MaxDatasetBytes <= 0 || payloadBytes <= 0 {
+		return p.Keyspace
+	}
+	fit := int(p.MaxDatasetBytes / int64(payloadBytes))
+	return max(1, min(p.Keyspace, fit))
+}
+
+// TasksFor shrinks the task count as the payload grows, so a step never moves
+// more than MaxTaskBytes, and never hands out fewer tasks than there are
+// agents.
+func (p Plan) TasksFor(pt Point) int {
+	tasks := p.Tasks
+	if p.MaxTaskBytes > 0 && pt.PayloadBytes > 0 {
+		tasks = min(tasks, int(p.MaxTaskBytes/int64(pt.PayloadBytes)))
+	}
+	return max(tasks, pt.Agents, 1)
+}
+
 // Header is the first line of a trace file: everything needed to interpret
 // the step records that follow it.
 type Header struct {
-	Type       string   `json:"type"`
-	Sweep      string   `json:"sweep"`
-	StartedAt  string   `json:"started_at"`
-	Connectors []string `json:"connectors"`
-	Plan       Plan     `json:"plan"`
-	Warmup     string   `json:"warmup"`
-	Duration   string   `json:"duration"`
-	Cooldown   string   `json:"cooldown"`
-	OpTimeout  string   `json:"op_timeout"`
-	Steps      int      `json:"steps"`
+	Type        string   `json:"type"`
+	Sweep       string   `json:"sweep"`
+	StartedAt   string   `json:"started_at"`
+	Connectors  []string `json:"connectors"`
+	Plan        Plan     `json:"plan"`
+	Cooldown    string   `json:"cooldown"`
+	OpTimeout   string   `json:"op_timeout"`
+	StepTimeout string   `json:"step_timeout"`
+	Steps       int      `json:"steps"`
 }
 
 // Record is one operation of one connector at one point: a line of the trace.
@@ -122,9 +166,9 @@ type Record struct {
 	CapturedAt string `json:"captured_at"`
 
 	Dimension    string `json:"dimension"`
-	Rate         int    `json:"rate"`
+	Agents       int    `json:"agents"`
 	PayloadBytes int    `json:"payload_bytes"`
-	Concurrency  int    `json:"concurrency"`
+	Tasks        int    `json:"tasks"`
 	Keyspace     int    `json:"keyspace"`
 
 	Connector string `json:"connector"`
@@ -132,18 +176,16 @@ type Record struct {
 	Mode      string `json:"mode"`
 	Op        string `json:"op"`
 
-	Paced        bool    `json:"paced"`
-	Elapsed      float64 `json:"elapsed_seconds"`
-	AchievedRate float64 `json:"achieved_rate"`
-	Ops          uint64  `json:"ops"`
-	Errors       uint64  `json:"errors"`
-	Timeouts     uint64  `json:"timeouts"`
-	FirstError   string  `json:"first_error,omitempty"`
-	Throughput   float64 `json:"throughput"`
+	Elapsed    float64 `json:"elapsed_seconds"` // makespan of the whole step, all ops
+	Completed  uint64  `json:"completed"`       // tasks finished in the step, all ops
+	Truncated  bool    `json:"truncated"`       // the step hit its timeout first
+	Ops        uint64  `json:"ops"`
+	Errors     uint64  `json:"errors"`
+	Timeouts   uint64  `json:"timeouts"`
+	FirstError string  `json:"first_error,omitempty"`
+	Throughput float64 `json:"throughput"`
 
 	Latency stats.Summary `json:"latency"`
-	Stall   stats.Summary `json:"stall"`
-	Wait    stats.Summary `json:"wait"`
 }
 
 // Run measures every connector at every point of the plan, one connector at a
@@ -171,33 +213,31 @@ func Run(ctx context.Context, conns []connector.Connector, w *connector.Workload
 	if err := enc.Encode(Header{
 		Type: "sweep", Sweep: id, StartedAt: time.Now().UTC().Format(time.RFC3339),
 		Connectors: names, Plan: plan,
-		Warmup: plan.Warmup.String(), Duration: plan.Duration.String(),
 		Cooldown: plan.Cooldown.String(), OpTimeout: plan.OpTimeout.String(),
-		Steps: len(pts) * len(conns),
+		StepTimeout: plan.StepTimeout.String(), Steps: len(pts) * len(conns),
 	}); err != nil {
 		return path, err
 	}
 
-	log.Printf("sweep %s: %d points x %d connectors, %s warmup + %s measured per step, writing %s",
-		id, len(pts), len(conns), plan.Warmup, plan.Duration, path)
+	log.Printf("sweep %s: %d points x %d connectors, up to %d tasks per step, writing %s",
+		id, len(pts), len(conns), plan.Tasks, path)
 
 	step := 0
 	for _, pt := range pts {
 		w.SetPayloadBytes(pt.PayloadBytes)
+		keyspace := plan.KeyspaceFor(pt.PayloadBytes)
+		w.SetKeyspace(keyspace)
+		tasks := plan.TasksFor(pt)
 
 		for _, c := range conns {
 			step++
 			name := connector.Name(c)
-			rate := strconv.Itoa(pt.Rate)
-			if pt.Rate == 0 {
-				rate = "closed-loop"
-			}
-			log.Printf("step %d/%d [%s] %s rate=%s payload=%dB concurrency=%d",
-				step, len(pts)*len(conns), pt.Dimension, name, rate, pt.PayloadBytes, pt.Concurrency)
+			log.Printf("step %d/%d [%s] %s agents=%d payload=%dB tasks=%d keyspace=%d",
+				step, len(pts)*len(conns), pt.Dimension, name, pt.Agents, pt.PayloadBytes, tasks, keyspace)
 			metrics.SetStep(id, pt.Dimension, name,
-				strconv.Itoa(pt.Rate), strconv.Itoa(pt.PayloadBytes), strconv.Itoa(pt.Concurrency))
+				strconv.Itoa(pt.Agents), strconv.Itoa(pt.PayloadBytes), strconv.Itoa(tasks))
 
-			if err := runner.Seed(ctx, c, plan.Keyspace, plan.OpTimeout); err != nil {
+			if err := runner.Seed(ctx, c, keyspace, plan.OpTimeout); err != nil {
 				if ctx.Err() != nil {
 					return path, ctx.Err()
 				}
@@ -206,11 +246,11 @@ func Run(ctx context.Context, conns []connector.Connector, w *connector.Workload
 			}
 
 			res, err := runner.Step(ctx, c, runner.Options{
-				Concurrency: pt.Concurrency,
-				Rate:        pt.Rate,
-				Warmup:      plan.Warmup,
-				Duration:    plan.Duration,
+				Agents:      pt.Agents,
+				Tasks:       tasks,
+				WarmupTasks: min(plan.WarmupTasks, tasks/10),
 				OpTimeout:   plan.OpTimeout,
+				StepTimeout: plan.StepTimeout,
 			})
 			if err != nil {
 				return path, err
@@ -220,12 +260,12 @@ func Run(ctx context.Context, conns []connector.Connector, w *connector.Workload
 			for _, o := range res.Ops {
 				rec := Record{
 					Type: "step", Sweep: id, CapturedAt: now,
-					Dimension: pt.Dimension, Rate: pt.Rate, PayloadBytes: pt.PayloadBytes,
-					Concurrency: pt.Concurrency, Keyspace: plan.Keyspace,
+					Dimension: pt.Dimension, Agents: pt.Agents, PayloadBytes: pt.PayloadBytes,
+					Tasks: tasks, Keyspace: keyspace,
 					Connector: name, Backend: c.Backend(), Mode: c.Mode(), Op: o.Op,
-					Paced: res.Paced, Elapsed: res.Elapsed.Seconds(), AchievedRate: res.AchievedRate,
-					Ops: o.Ops, Errors: o.Errors, Timeouts: o.Timeouts, FirstError: o.FirstError, Throughput: o.Throughput,
-					Latency: o.Latency, Stall: o.Stall, Wait: o.Wait,
+					Elapsed: res.Elapsed.Seconds(), Completed: res.Completed, Truncated: res.Truncated,
+					Ops: o.Ops, Errors: o.Errors, Timeouts: o.Timeouts, FirstError: o.FirstError,
+					Throughput: o.Throughput, Latency: o.Latency,
 				}
 				if err := enc.Encode(rec); err != nil {
 					return path, fmt.Errorf("write record: %w", err)

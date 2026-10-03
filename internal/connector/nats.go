@@ -12,11 +12,14 @@ import (
 
 // nats configuration
 const (
-	natsStream       = "BENCH"
-	natsSubjects     = "bench.>"
-	natsTopicDirect  = "bench.direct"
-	natsTopicDapr    = "bench.dapr"
-	natsSetupTimeout = 10 * time.Second
+	natsStream        = "BENCH"
+	natsSubjects      = "bench.>"
+	natsTopicDirect   = "bench.direct"
+	natsTopicDapr     = "bench.dapr"
+	natsStatDirect    = "bench.stat.direct"
+	natsStatDapr      = "bench.stat.dapr"
+	natsSetupTimeout  = 10 * time.Second
+	natsStreamMaxSize = 1 << 30 // bytes kept on disk before the oldest messages go
 )
 
 // NATSDirect publishes with JetStream and waits for the server ack.
@@ -62,6 +65,7 @@ func (n *NATSDirect) Connect(ctx context.Context) error {
 		Retention: jetstream.LimitsPolicy,
 		Storage:   jetstream.FileStorage,
 		MaxMsgs:   100_000,
+		MaxBytes:  natsStreamMaxSize,
 		MaxAge:    10 * time.Minute,
 	})
 
@@ -72,12 +76,23 @@ func (n *NATSDirect) Connect(ctx context.Context) error {
 	return nil
 }
 
+// Seed is a no-op: a publish depends on nothing that came before it.
+func (n *NATSDirect) Seed(context.Context, int) error { return nil }
+
 func (n *NATSDirect) Ops() []Op {
 	return []Op{
 		{
-			Name: "publish",
+			Name: OpPublish,
 			Run: func(ctx context.Context, i int) error {
 				_, err := n.js.Publish(ctx, natsTopicDirect, n.workload.Payload())
+				return err
+			},
+		},
+		{
+			// a one-byte acked publish: the lightest round trip the API offers
+			Name: OpStat,
+			Run: func(ctx context.Context, i int) error {
+				_, err := n.js.Publish(ctx, natsStatDirect, Marker)
 				return err
 			},
 		},
@@ -108,12 +123,20 @@ func (n *NATSDapr) Backend() string { return BackendNATS }
 
 func (n *NATSDapr) Connect(ctx context.Context) error { return n.connect(ctx) }
 
+func (n *NATSDapr) Seed(context.Context, int) error { return nil }
+
 func (n *NATSDapr) Ops() []Op {
 	return []Op{
 		{
-			Name: "publish",
+			Name: OpPublish,
 			Run: func(ctx context.Context, i int) error {
 				return n.client.PublishEvent(ctx, n.pubsub, natsTopicDapr, n.workload.Payload())
+			},
+		},
+		{
+			Name: OpStat,
+			Run: func(ctx context.Context, i int) error {
+				return n.client.PublishEvent(ctx, n.pubsub, natsStatDapr, Marker)
 			},
 		},
 	}

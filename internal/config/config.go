@@ -43,11 +43,13 @@ func Load() (Config, error) {
 			NATSURL:     env("NATS_URL", "nats://nats:4222"),
 			RedisAddr:   env("REDIS_ADDR", "redis:6379"),
 			PostgresDSN: env("POSTGRES_DSN", "postgres://bench:bench@postgres:5432/bench?sslmode=disable"),
+			FSDir:       env("FS_DIR", "/data/direct"),
 
 			DaprGRPCPort:   env("DAPR_GRPC_PORT", "50001"),
 			DaprPubsubNATS: env("DAPR_PUBSUB_NATS", "pubsub-nats"),
 			DaprStateRedis: env("DAPR_STATE_REDIS", "statestore-redis"),
 			DaprStatePG:    env("DAPR_STATE_POSTGRES", "statestore-postgres"),
+			DaprBindingFS:  env("DAPR_BINDING_FS", "binding-fs"),
 		},
 
 		Connectors: envList("CONNECTORS", "redis-direct,redis-dapr"),
@@ -55,19 +57,26 @@ func Load() (Config, error) {
 		Plan: sweep.Plan{
 			Mode: env("SWEEP_MODE", sweep.ModeOneAtATime),
 			Baseline: sweep.Point{
-				Rate:         envInt("RATE", 200),
+				Agents:       envInt("AGENTS", 8),
 				PayloadBytes: envInt("PAYLOAD_BYTES", 256),
-				Concurrency:  envInt("CONCURRENCY", 8),
 			},
-			Rates:         envInts("SWEEP_RATE", "0,50,200,1000,5000,20000,50000,100000"),
-			PayloadBytes:  envInts("SWEEP_PAYLOAD_BYTES", "256,1024,4096,16384"),
-			Concurrencies: envInts("SWEEP_CONCURRENCY", "1,8,32,128"),
+			Agents:       envInts("SWEEP_AGENTS", "1,8,32,128,512,2048,8192,32768,131072,1000000"),
+			PayloadBytes: envInts("SWEEP_PAYLOAD_BYTES", "256,1024,4096,16384,1048576,16777216,134217728,1073741824"),
 
-			Keyspace:  envInt("KEYSPACE", 1000),
-			Warmup:    envDuration("STEP_WARMUP", 5*time.Second),
-			Duration:  envDuration("STEP_DURATION", 30*time.Second),
-			Cooldown:  envDuration("STEP_COOLDOWN", 5*time.Second),
-			OpTimeout: envDuration("OP_TIMEOUT", 5*time.Second),
+			// large payloads are moved by a single agent; many agents move the
+			// baseline payload
+			PayloadSweepAgents: envInt("PAYLOAD_SWEEP_AGENTS", 1),
+
+			Tasks:        envInt("TASKS", 100_000),
+			MaxTaskBytes: envInt64("MAX_TASK_BYTES", 8<<30),
+			WarmupTasks:  envInt("WARMUP_TASKS", 1000),
+
+			Keyspace:        envInt("KEYSPACE", 1000),
+			MaxDatasetBytes: envInt64("MAX_DATASET_BYTES", 256<<20),
+
+			Cooldown:    envDuration("STEP_COOLDOWN", 5*time.Second),
+			OpTimeout:   envDuration("OP_TIMEOUT", 5*time.Second),
+			StepTimeout: envDuration("STEP_TIMEOUT", 30*time.Minute),
 		},
 
 		ResultsDir:  env("RESULTS_DIR", "traces"),
@@ -87,15 +96,18 @@ func (c Config) validate() error {
 	if c.Plan.Mode != sweep.ModeOneAtATime && c.Plan.Mode != sweep.ModeGrid {
 		return fmt.Errorf("SWEEP_MODE must be %q or %q, got %q", sweep.ModeOneAtATime, sweep.ModeGrid, c.Plan.Mode)
 	}
-	if c.Plan.Duration <= 0 {
-		return fmt.Errorf("STEP_DURATION must be positive")
+	if c.Plan.Tasks < 1 {
+		return fmt.Errorf("TASKS must be at least 1")
 	}
-	if c.Plan.Baseline.Concurrency < 1 {
-		return fmt.Errorf("CONCURRENCY must be at least 1")
+	if c.Plan.StepTimeout <= 0 {
+		return fmt.Errorf("STEP_TIMEOUT must be positive")
 	}
-	for _, n := range c.Plan.Concurrencies {
+	if c.Plan.Baseline.Agents < 1 || c.Plan.PayloadSweepAgents < 1 {
+		return fmt.Errorf("AGENTS and PAYLOAD_SWEEP_AGENTS must be at least 1")
+	}
+	for _, n := range c.Plan.Agents {
 		if n < 1 {
-			return fmt.Errorf("SWEEP_CONCURRENCY levels must be at least 1")
+			return fmt.Errorf("SWEEP_AGENTS levels must be at least 1")
 		}
 	}
 	return nil
@@ -110,6 +122,13 @@ func env(key, fallback string) string {
 
 func envInt(key string, fallback int) int {
 	if v, err := strconv.Atoi(env(key, "")); err == nil {
+		return v
+	}
+	return fallback
+}
+
+func envInt64(key string, fallback int64) int64 {
+	if v, err := strconv.ParseInt(env(key, ""), 10, 64); err == nil {
 		return v
 	}
 	return fallback

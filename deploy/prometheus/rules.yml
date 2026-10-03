@@ -14,13 +14,6 @@ groups:
       - record: bench:latency_p99
         expr: histogram_quantile(0.99, sum by (backend, mode, op, le) (rate(bench_op_duration_seconds_bucket[1m])))
 
-      # Stall: how long a call waited past its scheduled send time before it
-      # could start. Zero while the connector keeps up with the target rate.
-      - record: bench:stall_p50
-        expr: histogram_quantile(0.50, sum by (backend, mode, op, le) (rate(bench_op_stall_seconds_bucket[1m])))
-      - record: bench:stall_p99
-        expr: histogram_quantile(0.99, sum by (backend, mode, op, le) (rate(bench_op_stall_seconds_bucket[1m])))
-
       # Successful operations per second per connector.
       - record: bench:throughput
         expr: sum by (backend, mode, op) (rate(bench_ops_total{status="ok"}[1m]))

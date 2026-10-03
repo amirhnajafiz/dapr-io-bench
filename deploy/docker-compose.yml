@@ -1,12 +1,19 @@
 name: dapr-overhead-bench
 
+# Each backend sits behind a profile named after it, so a run starts only the
+# backend under test: COMPOSE_PROFILES=redis and BACKEND=redis (both set by
+# `make sweep BACKEND=redis`). The sidecar likewise loads only that backend's
+# Dapr component. The filesystem pair needs no backend container at all.
 services:
   # Backends
   nats:
     image: nats:2.10-alpine
-    # -js enables JetStream (needed for acked publishes and Dapr's jetstream
-    # component); -m exposes the monitoring endpoint used by the healthcheck.
-    command: ["-js", "-m", "8222"]
+    profiles: ["nats"]
+    # nats.conf enables JetStream, exposes the monitoring endpoint used by the
+    # healthcheck, and raises max_payload for the payload sweep.
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./nats/nats.conf:/etc/nats/nats.conf:ro
     ports:
       - "4222:4222"
       - "8222:8222"
@@ -18,6 +25,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    profiles: ["postgres"]
     environment:
       POSTGRES_USER: bench
       POSTGRES_PASSWORD: bench
@@ -32,6 +40,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    profiles: ["redis"]
     ports:
       - "6379:6379"
     healthcheck:
@@ -50,43 +59,63 @@ services:
       NATS_URL: "nats://nats:4222"
       REDIS_ADDR: "redis:6379"
       POSTGRES_DSN: "postgres://bench:bench@postgres:5432/bench?sslmode=disable"
+      FS_DIR: "/data/direct"
       DAPR_GRPC_PORT: "50001"
 
       # Which pair to compare in this run. At most two connectors, so only one
       # backend is ever under load. Override per run: CONNECTORS=nats-direct,nats-dapr
       CONNECTORS: "${CONNECTORS:-redis-direct,redis-dapr}"
 
-      # Baseline point: every sweep varies one of these while holding the others.
-      RATE: "${RATE:-200}"                    # ops/sec, 0 = closed loop (no stall measured)
-      PAYLOAD_BYTES: "${PAYLOAD_BYTES:-256}"
-      CONCURRENCY: "${CONCURRENCY:-8}"        # concurrent callers ("agents")
-      KEYSPACE: "${KEYSPACE:-1000}"
-
-      # Levels to sweep per dimension. An empty list skips that dimension.
+      # Two dimensions: how many agents share the tasks, and how large each
+      # value is. Large payloads are moved by few agents, many agents move the
+      # baseline payload. Every step is closed loop: an agent takes the next
+      # task the moment its previous call returns.
+      AGENTS: "${AGENTS:-8}"                  # baseline agents, used by the payload sweep's baseline point
+      PAYLOAD_BYTES: "${PAYLOAD_BYTES:-256}"  # baseline payload, used by the agents sweep
+      SWEEP_AGENTS: "${SWEEP_AGENTS-1,8,32,128,512,2048,8192,32768,131072,1000000}"
+      SWEEP_PAYLOAD_BYTES: "${SWEEP_PAYLOAD_BYTES-256,1024,4096,16384,1048576,16777216,134217728,1073741824}"
+      PAYLOAD_SWEEP_AGENTS: "${PAYLOAD_SWEEP_AGENTS:-1}"
       SWEEP_MODE: "${SWEEP_MODE:-oat}"        # oat = one dimension at a time; grid = every combination
-      SWEEP_RATE: "${SWEEP_RATE-0,50,200,1000,5000,20000,50000,100000}"
-      SWEEP_PAYLOAD_BYTES: "${SWEEP_PAYLOAD_BYTES-256,1024,4096,16384}"
-      SWEEP_CONCURRENCY: "${SWEEP_CONCURRENCY-1,8,32,128}"
 
-      # Per step, per connector.
-      STEP_WARMUP: "${STEP_WARMUP:-5s}"       # discarded
-      STEP_DURATION: "${STEP_DURATION:-30s}"  # measured
+      # Work per step. Tasks shrink at large payloads so a step never moves
+      # more than MAX_TASK_BYTES, and never fall below the number of agents.
+      TASKS: "${TASKS:-100000}"
+      MAX_TASK_BYTES: "${MAX_TASK_BYTES:-8589934592}"
+      WARMUP_TASKS: "${WARMUP_TASKS:-1000}"   # run first and discarded (capped at a tenth of the tasks)
+      KEYSPACE: "${KEYSPACE:-1000}"
+      MAX_DATASET_BYTES: "${MAX_DATASET_BYTES:-268435456}"  # keyspace shrinks so seeding never exceeds this
+
       STEP_COOLDOWN: "${STEP_COOLDOWN:-5s}"   # idle gap before the next connector starts
-      OP_TIMEOUT: "${OP_TIMEOUT:-5s}"
+      OP_TIMEOUT: "${OP_TIMEOUT:-5s}"         # per operation
+      STEP_TIMEOUT: "${STEP_TIMEOUT:-30m}"    # per step; a step that hits it is recorded as truncated
 
       RESULTS_DIR: "/traces"
     volumes:
       - ../traces:/traces
+      - fsdata:/data # shared with the sidecar: the filesystem pair's disk
+    # a million users each hold a file or a socket. This is the kernel's default
+    # fs.nr_open, the most a container can get without a host sysctl change; the
+    # top concurrency level may still see EMFILE on the filesystem pair.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     ports:
       - "9100:9100" # bench exporter
       - "9090:9090" # dapr sidecar metrics (same namespace, see below)
+    # Wait for whichever backend the active profile started; the others are not
+    # required, so an inactive profile is not an error. The app also retries
+    # connecting for a minute as a fallback.
     depends_on:
       nats:
         condition: service_healthy
+        required: false
       postgres:
         condition: service_healthy
+        required: false
       redis:
         condition: service_healthy
+        required: false
 
   dapr:
     image: daprio/daprd:1.14.4
@@ -98,12 +127,33 @@ services:
       - "--config=/config/config.yaml"
       - "--metrics-port=9090"
       - "--log-level=info"
+      # 4 MB by default, which would cap the payload sweep; this is in MB and
+      # applies to the gRPC API as well as HTTP
+      - "--dapr-http-max-request-size=1024"
     volumes:
-      - ./dapr/components:/components:ro
+      # Only the component for the backend under test: a component whose
+      # backend is not running fails to initialise and takes the sidecar down.
+      - ./dapr/components/${BACKEND:-redis}:/components:ro
       - ./dapr/config.yaml:/config/config.yaml:ro
+      - fsdata:/data
     network_mode: "service:bench"
+    # the component for the backend under test fails to initialise, fatally,
+    # if the backend is not yet accepting connections
     depends_on:
-      - bench
+      bench:
+        condition: service_started
+      nats:
+        condition: service_healthy
+        required: false
+      postgres:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
+    # a gigabyte value may take the sidecar down with it; come back so the
+    # rest of the sweep still has a sidecar to measure
+    restart: unless-stopped
 
   # Observability
 
@@ -119,3 +169,6 @@ services:
       - "9091:9090"
     depends_on:
       - bench
+
+volumes:
+  fsdata:

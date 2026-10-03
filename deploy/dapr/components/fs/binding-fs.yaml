@@ -1,0 +1,13 @@
+# Dapr local-storage output binding: file I/O done by the sidecar in a
+# directory on the volume the bench container also mounts, so the direct and
+# the Dapr filesystem connectors write to the same disk.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: binding-fs
+spec:
+  type: bindings.localstorage
+  version: v1
+  metadata:
+    - name: rootPath
+      value: "/data/dapr"

@@ -4,7 +4,7 @@
     scripts/plot_results.py traces/*.jsonl [-o plots/]
 
 One SVG per backend, operation and load dimension, e.g.
-plots/redis/write_vs_rps.svg: four panels (p50 latency, p99 latency,
+plots/redis/write_vs_agents.svg: four panels (p50 latency, p99 latency,
 throughput, error rate) with the dimension on the x axis (log scale), one
 line for the direct path and one for Dapr. Next to the charts,
 plots/<backend>/summary.md tabulates every point with the Dapr-vs-direct
@@ -34,11 +34,25 @@ GRID = "#dfdeda"  # recessive hairline gridlines
 
 DIMENSIONS = OrderedDict(
     [
-        ("rate", {"label": "RPS", "slug": "rps"}),
-        ("payload_bytes", {"label": "payload bytes", "slug": "payload"}),
-        ("concurrency", {"label": "concurrent users", "slug": "users"}),
+        ("agents", {"label": "concurrent agents", "slug": "agents"}),
+        ("payload_bytes", {"label": "payload size", "slug": "payload"}),
     ]
 )
+
+BACKEND_NAMES = {"nats": "NATS", "postgres": "PostgreSQL", "redis": "Redis", "fs": "Filesystem"}
+OP_NAMES = {"stat": "stat (light, no payload)", "publish": "publish", "write": "write", "read": "read"}
+
+
+def held_text(dimension, held):
+    """Describes the dimension a chart holds fixed, e.g. "256 B payload"."""
+    others = [d for d in DIMENSIONS if d != dimension]
+    parts = []
+    for d, v in zip(others, held):
+        if d == "payload_bytes":
+            parts.append(f"{fmt_x(v, d)} payload")
+        else:
+            parts.append(f"{v:,} agent" + ("s" if v != 1 else ""))
+    return ", ".join(parts)
 
 # Panels, in display order: (title, unit, scale, extractor, higher_is_better)
 METRICS = OrderedDict(
@@ -49,6 +63,10 @@ METRICS = OrderedDict(
         ("errors", ("error rate", "%", 1.0, lambda r: 100.0 * r["errors"] / r["ops"] if r["ops"] else 0.0, False)),
     ]
 )
+# Tabulated but not charted: the time for all tasks of the step to finish,
+# which is what a group of agents waits for.
+TABLE_METRICS = dict(METRICS)
+TABLE_METRICS["makespan"] = ("makespan", "s", 1.0, lambda r: r["elapsed_seconds"], False)
 
 
 # --- Loading -----------------------------------------------------------------
@@ -67,8 +85,8 @@ def load(paths):
                 rec = json.loads(line)
                 if rec.get("type") == "step":
                     key = (
-                        rec["backend"], rec["mode"], rec["op"],
-                        rec["rate"], rec["payload_bytes"], rec["concurrency"],
+                        rec["backend"], rec["mode"], rec["op"], rec.get("dimension"),
+                        rec["agents"], rec["payload_bytes"],
                     )
                     if key in latest and latest[key]["captured_at"] > rec["captured_at"]:
                         continue
@@ -87,12 +105,17 @@ def series(records, dimension):
     others = [d for d in DIMENSIONS if d != dimension]
     out = defaultdict(lambda: defaultdict(list))
     for r in records:
+        # only points measured for this dimension (plus the shared baseline and
+        # grid points): otherwise an agents-sweep point from one run and a
+        # payload-sweep point from another could pair up into a bogus curve
+        tags = set(r.get("dimension", dimension).split(","))
+        if not tags & {dimension, "baseline", "grid"}:
+            continue
         held = tuple(r[d] for d in others)
         out[(r["op"], held)][r["mode"]].append((r[dimension], r))
     for group in out.values():
         for mode in group:
-            # a closed-loop point (rate 0) is the ceiling, so it sorts last
-            group[mode].sort(key=lambda p: (p[0] == 0, p[0]))
+            group[mode].sort(key=lambda p: p[0])
     # a group needs at least two x values to be a curve
     return {
         k: g for k, g in out.items()
@@ -141,11 +164,25 @@ def fmt_tick(value, step, unit):
     return f"{value:.{decimals}f}"
 
 
-def fmt_x(x):
-    """Axis label for a swept level: round thousands as 5k, anything else
-    with a separator, so 1024 stays 1,024 rather than 1.024k."""
-    if x == 0:
-        return "closed loop"
+def fmt_eng(x):
+    """Compact axis label: plain below 1000, otherwise mantissa and power of ten
+    with up to three significant figures (1e3, 5e4, 1.31e5)."""
+    if x < 1000:
+        return f"{x:g}"
+    e = math.floor(math.log10(x))
+    m = x / 10 ** e
+    text = f"{m:.2f}".rstrip("0").rstrip(".")
+    return f"{text}e{e}"
+
+
+def fmt_x(x, dimension="agents"):
+    """Axis label for a swept level. Byte sizes use binary units (16 KiB,
+    1 GiB); counts use round thousands (5k, 1M) and a separator otherwise."""
+    if dimension == "payload_bytes":
+        for unit, size in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+            if x >= size and x % size == 0:
+                return f"{x // size} {unit}"
+        return f"{x:,} B"
     if x >= 1_000_000 and x % 1_000_000 == 0:
         return f"{x // 1_000_000}M"
     if x >= 1000 and x % 1000 == 0:
@@ -154,21 +191,18 @@ def fmt_x(x):
 
 
 # --- Layout (px) --------------------------------------------------------------
-PANEL_W, PANEL_H = 500, 250  # one metric per panel, title and axes included
+PANEL_W, PANEL_H = 560, 240  # one metric per panel, title strip and axis included
 COLS = 2
-PAD, GAP_X, GAP_Y = 28, 44, 30
-AXIS_L, AXIS_B = 66, 52  # room for y tick labels / x tick labels inside a panel
-TITLE_H = 30  # panel title strip above the plot area
-LABEL_W = 56  # room to the right of the last point for its end label
-CLOSED_W = 78  # slot at the right end of the RPS axis for the closed-loop point
-HEAD = 78  # centred title + legend block above the first row
+PAD, GAP_X, GAP_Y = 36, 56, 36
+AXIS_L, AXIS_B = 72, 32  # room for y tick labels / one row of x tick labels
+TITLE_H = 40  # panel title strip above the plot area
+HEAD = 104  # title, subtitle and legend above the first row
 AXIS = "#8a8985"  # the two axis lines, a step darker than the grid
 STROKE = 3  # series line width
 
 
 def x_scale(levels, width):
-    """Log x scale over the swept levels (they are geometric), linear if a level
-    is zero (a closed-loop rate of 0 cannot sit on a log axis)."""
+    """Log x scale over the swept levels (they are geometric)."""
     lo, hi = min(levels), max(levels)
     if lo <= 0 or lo == hi:
         span = (hi - lo) or 1
@@ -186,45 +220,47 @@ def log_ticks(lo, hi):
     return [10.0 ** e for e in range(lo_exp, hi_exp + 1)]
 
 
-def render(backend, op, dimension, group, out_path):
+def render(backend, op, dimension, held, group, out_path):
     """Writes one SVG: a panel per metric, direct and dapr curves in each."""
     metrics = list(METRICS)
     levels = sorted({x for pts in group.values() for x, _ in pts})
-    # A closed-loop point (rate 0) is not a rate: it is each path's ceiling,
-    # so it sits in its own slot past the end of the log axis.
-    paced = [x for x in levels if x > 0]
-    closed = dimension == "rate" and 0 in levels
+    tasks = sorted({r["tasks"] for pts in group.values() for _, r in pts})
     rows = math.ceil(len(metrics) / COLS)
     width = PAD * 2 + COLS * PANEL_W + (COLS - 1) * GAP_X
     height = PAD + HEAD + rows * PANEL_H + (rows - 1) * GAP_Y + PAD
     dim_label = DIMENSIONS[dimension]["label"]
+    tasks_txt = (f"{tasks[0]:,} tasks per step" if len(tasks) == 1
+                 else f"{tasks[0]:,} to {tasks[-1]:,} tasks per step")
 
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" font-family="system-ui, -apple-system, sans-serif">',
         f'<rect width="{width}" height="{height}" fill="{SURFACE}"/>',
-        f'<text x="{width / 2:.1f}" y="{PAD + 6}" font-size="22" font-weight="600" fill="{INK}" text-anchor="middle">'
-        f'{esc(backend)} {esc(op)} <tspan font-weight="400" fill="{INK_MUTED}">vs {esc(dim_label)}</tspan></text>',
+        # Title: what is compared. Subtitle: what moves along x, what is held, how much work.
+        f'<text x="{width / 2:.1f}" y="{PAD + 10}" font-size="24" font-weight="600" fill="{INK}" text-anchor="middle">'
+        f'{esc(BACKEND_NAMES.get(backend, backend))} {esc(OP_NAMES.get(op, op))}: '
+        f'<tspan fill="{RGB["direct"]}">direct</tspan> vs <tspan fill="{RGB["dapr"]}">Dapr</tspan></text>',
+        f'<text x="{width / 2:.1f}" y="{PAD + 38}" font-size="15" fill="{INK_MUTED}" text-anchor="middle">'
+        f'x axis: {esc(dim_label)}'
+        + (' in bytes' if dimension == "payload_bytes" else '')
+        + f' (log scale) · held fixed: {esc(held_text(dimension, held))} · {tasks_txt}</text>',
     ]
-    # Legend, centred under the title: always present for two series, so
-    # identity is never colour-alone. Dapr is dashed as well as orange, so the
-    # two stay tellable where they overlap.
-    key_w, gap, entry_gap = 28, 8, 40
-    text_w = {"direct": 44, "dapr": 36}
+    # Legend, centred under the subtitle. Dapr is dashed as well as orange, so
+    # the two stay tellable where they overlap.
+    key_w, gap, entry_gap = 30, 9, 44
+    text_w = {"direct": 48, "dapr": 40}
     total = sum(key_w + gap + text_w[m] for m in MODES) + entry_gap * (len(MODES) - 1)
     lx = width / 2 - total / 2
-    ly = PAD + 34
+    ly = PAD + 64
     for mode in MODES:
         svg.append(f'<line x1="{lx:.1f}" y1="{ly}" x2="{lx + key_w:.1f}" y2="{ly}" {stroke_attrs(mode)}/>')
         svg.append(f'<circle cx="{lx + key_w / 2:.1f}" cy="{ly}" r="5" fill="{RGB[mode]}" stroke="{SURFACE}" stroke-width="2"/>')
         svg.append(f'<text x="{lx + key_w + gap:.1f}" y="{ly + 5}" font-size="14" fill="{INK}">{mode}</text>')
         lx += key_w + gap + text_w[mode] + entry_gap
 
-    plot_w = PANEL_W - AXIS_L - LABEL_W
+    plot_w = PANEL_W - AXIS_L
     plot_h = PANEL_H - TITLE_H - AXIS_B
-    line_w = plot_w - (CLOSED_W if closed else 0)
-    sx_paced = x_scale(paced or [1], line_w)
-    sx = lambda x: sx_paced(x) if x > 0 else plot_w  # noqa: E731
+    sx = x_scale(levels, plot_w)
 
     for n, metric in enumerate(metrics):
         title, unit, scale, get, higher_better = METRICS[metric]
@@ -235,77 +271,47 @@ def render(backend, op, dimension, group, out_path):
         }
         values = [v for pts in curves.values() for _, v in pts]
         peak = max(values, default=0)
+        # a saturated path can hold a call for tens of seconds; read that in
+        # seconds rather than five-digit milliseconds
+        if unit == "ms" and peak >= 5000:
+            unit = "s"
+            curves = {m: [(x, v / 1000) for x, v in pts] for m, pts in curves.items()}
+            peak /= 1000
 
-        # Throughput against RPS spans orders of magnitude and tracks the
-        # target, so it gets a log axis: a path that keeps up is a straight
-        # diagonal, and one that falls behind visibly bends away from it.
-        logy = metric == "throughput" and dimension == "rate" and min(values, default=0) > 0
-        if logy:
-            ticks = log_ticks(min(values), peak)
-            lo, hi = math.log10(ticks[0]), math.log10(ticks[-1])
-            sy = lambda v: oy + plot_h - plot_h * (math.log10(v) - lo) / (hi - lo)  # noqa: E731
-            step = None
-        else:
-            axis_max, ticks = nice_ticks(peak)
-            step = ticks[1] - ticks[0]
-            sy = lambda v: oy + plot_h - plot_h * (v / axis_max)  # noqa: E731
+        axis_max, ticks = nice_ticks(peak)
+        step = ticks[1] - ticks[0]
+        sy = lambda v: oy + plot_h - plot_h * (v / axis_max)  # noqa: E731
 
         better = "higher is better" if higher_better else "lower is better"
         svg.append(
-            f'<text x="{ox - AXIS_L}" y="{oy - 12}" font-size="15" font-weight="600" fill="{INK}">'
-            f'{esc(title)} <tspan font-weight="400" fill="{INK_MUTED}">({unit}, {better})</tspan></text>'
+            f'<text x="{ox - AXIS_L}" y="{oy - 20}" font-size="16" font-weight="600" fill="{INK}">'
+            f'{esc(title)} <tspan font-weight="400" fill="{INK_MUTED}">· {unit} · {better}</tspan></text>'
         )
         # Gridlines first, so marks paint over them.
         for t in ticks:
             y = sy(t)
             svg.append(f'<line x1="{ox}" y1="{y:.1f}" x2="{ox + plot_w}" y2="{y:.1f}" stroke="{GRID}" stroke-width="1"/>')
-            label = fmt(t, unit) if logy else fmt_tick(t, step, unit)
-            svg.append(f'<text x="{ox - 10}" y="{y + 4.5:.1f}" font-size="13" fill="{INK}" text-anchor="end">{label}</text>')
-        last_label_x = None
-        for x in paced + ([0] if closed else []):  # left to right, ceiling last
+            svg.append(f'<text x="{ox - 10}" y="{y + 4.5:.1f}" font-size="13" fill="{INK}" text-anchor="end">{fmt_tick(t, step, unit)}</text>')
+        # Tick labels are compact exponentials (1e3, 5e4), short enough for one row.
+        for x in levels:
             px = ox + sx(x)
             svg.append(f'<line x1="{px:.1f}" y1="{oy + plot_h}" x2="{px:.1f}" y2="{oy + plot_h + 5}" stroke="{AXIS}" stroke-width="1.5"/>')
-            # neighbouring levels on a log axis (50k, 100k) can land too close
-            # for their labels; the second one drops to a lower row
-            row = 1 if last_label_x is not None and px - last_label_x < 40 else 0
-            svg.append(f'<text x="{px:.1f}" y="{oy + plot_h + 21 + 15 * row}" font-size="13" fill="{INK}" text-anchor="middle">{fmt_x(x)}</text>')
-            last_label_x = None if row else px
-        svg.append(f'<text x="{ox + line_w / 2:.1f}" y="{oy + plot_h + 48}" font-size="13" fill="{INK_MUTED}" text-anchor="middle">{esc(dim_label)}</text>')
-        if closed:
-            # a divider between the paced region and the ceiling slot
-            dx = ox + line_w + CLOSED_W / 2
-            svg.append(f'<line x1="{dx:.1f}" y1="{oy}" x2="{dx:.1f}" y2="{oy + plot_h}" stroke="{GRID}" stroke-width="1"/>')
+            svg.append(f'<text x="{px:.1f}" y="{oy + plot_h + 21}" font-size="13" fill="{INK}" text-anchor="middle">{fmt_eng(x)}</text>')
         # The two axes, drawn after the grid so they sit on top of it.
         svg.append(f'<line x1="{ox}" y1="{oy}" x2="{ox}" y2="{oy + plot_h}" stroke="{AXIS}" stroke-width="1.5"/>')
         svg.append(f'<line x1="{ox}" y1="{oy + plot_h}" x2="{ox + plot_w}" y2="{oy + plot_h}" stroke="{AXIS}" stroke-width="1.5"/>')
 
-        # Lines through the paced points only (the closed-loop point is a
-        # different regime, so it is a marker on its own), then markers with a
-        # surface ring, then one end label per series.
+        # Lines, then markers with a surface ring. Values live in summary.md;
+        # per-point labels collided more than they informed.
         for mode in MODES:
-            pts = [(x, v) for x, v in curves[mode] if x > 0]
+            pts = curves[mode]
             if len(pts) < 2:
                 continue
             path = " ".join(f'{"M" if i == 0 else "L"}{ox + sx(x):.1f},{sy(v):.1f}' for i, (x, v) in enumerate(pts))
             svg.append(f'<path d="{path}" fill="none" {stroke_attrs(mode)}/>')
         for mode in MODES:
             for x, v in curves[mode]:
-                r = 7 if x == 0 else 5
-                svg.append(f'<circle cx="{ox + sx(x):.1f}" cy="{sy(v):.1f}" r="{r}" fill="{RGB[mode]}" stroke="{SURFACE}" stroke-width="2"/>')
-        # End labels sit to the right of the last point; when the two series
-        # end close together the labels are nudged apart, keeping their order.
-        ends = {mode: curves[mode][-1] for mode in MODES if curves[mode]}
-        ys = {mode: sy(v) for mode, (_, v) in ends.items()}
-        if len(ys) == 2 and abs(ys["direct"] - ys["dapr"]) < 16:
-            mid = (ys["direct"] + ys["dapr"]) / 2
-            upper = min(ys, key=ys.get)
-            for mode in ys:
-                ys[mode] = mid - 8 if mode == upper else mid + 8
-        for mode, (x, v) in ends.items():
-            svg.append(
-                f'<text x="{ox + sx(x) + 10:.1f}" y="{ys[mode] + 4.5:.1f}" font-size="13" fill="{INK}">'
-                f'{fmt(v, unit)}</text>'
-            )
+                svg.append(f'<circle cx="{ox + sx(x):.1f}" cy="{sy(v):.1f}" r="5" fill="{RGB[mode]}" stroke="{SURFACE}" stroke-width="2"/>')
 
     svg.append("</svg>")
     with open(out_path, "w") as fh:
@@ -325,6 +331,7 @@ TABLE_COLS = [
     ("p99 lat", "latency_p99"),
     ("thr", "throughput"),
     ("err", "errors"),
+    ("makespan", "makespan"),
 ]
 
 
@@ -336,9 +343,9 @@ def summary_rows(dimension, group):
             by_x[x][mode] = r
     rows = []
     for x in sorted(by_x, key=lambda x: (x == 0, x)):
-        cells = [fmt_x(x)]
+        cells = [fmt_x(x, dimension)]
         for _, metric in TABLE_COLS:
-            _, unit, scale, get, higher_better = METRICS[metric]
+            _, unit, scale, get, higher_better = TABLE_METRICS[metric]
             d = by_x[x].get("direct")
             p = by_x[x].get("dapr")
             dv = get(d) * scale if d else None
@@ -356,9 +363,10 @@ def summary_rows(dimension, group):
 
 def write_summary(backend, tables, out_path):
     lines = [f"# {backend}: direct vs Dapr", ""]
-    lines.append("Latency in ms, throughput in successful ops/s, errors in % of operations. "
-                 "The ratio is Dapr/direct for latency and errors and direct/Dapr for throughput, "
-                 "so above 1.0 always means Dapr is worse.")
+    lines.append("Latency in ms, throughput in successful ops/s, errors in % of operations, "
+                 "makespan in seconds for the whole step (all ops). The ratio is Dapr/direct for "
+                 "latency, errors and makespan and direct/Dapr for throughput, so above 1.0 always "
+                 "means Dapr is worse.")
     for (op, dimension, held), rows in tables:
         others = [d for d in DIMENSIONS if d != dimension]
         held_txt = ", ".join(f"{d}={v}" for d, v in zip(others, held))
@@ -403,11 +411,14 @@ def main():
                 per_op[op] += 1
             for (op, held), group in sorted(groups.items()):
                 name = f"{op}_vs_{DIMENSIONS[dimension]['slug']}"
-                # a grid run has several held groups per dimension; name them apart
+                # several load profiles for one dimension (a grid run, or old
+                # and new traces measured under different profiles) get named
+                # apart by what they hold, e.g. write_vs_payload_at_rate0_users1
                 if per_op[op] > 1:
-                    name += "_" + "_".join(str(v) for v in held)
+                    others = [d for d in DIMENSIONS if d != dimension]
+                    name += "_at_" + "_".join(f"{DIMENSIONS[d]['slug']}{v}" for d, v in zip(others, held))
                 path = os.path.join(out_dir, name + ".svg")
-                render(backend, op, dimension, group, path)
+                render(backend, op, dimension, held, group, path)
                 written.append(path)
                 tables.append(((op, dimension, held), summary_rows(dimension, group)))
         text = write_summary(backend, tables, os.path.join(out_dir, "summary.md"))

@@ -3,29 +3,36 @@
 [Dapr](https://dapr.io) is an open-source, portable runtime designed to help developers build resilient,
 secure, microservices-based distributed applications and AI agents.
 However, it comes with an I/O overhead caused by the additional layer introduced by Dapr.
-In this work, we run the same workload against each of **NATS**, **PostgreSQL**, and **Redis**
-twice: once through the native Go SDK and once through Dapr. The load is swept along three
-dimensions, and every step is recorded as a trace, so the overhead becomes a curve, not a guess.
+In this work, we run the same workload against each of **NATS**, **PostgreSQL**, **Redis** and
+a **filesystem** twice: once through the native Go SDK and once through Dapr. A step is a fixed
+batch of tasks shared by a number of agents, the load is swept along agents and payload size,
+and every step is recorded as a trace, so the overhead becomes a curve, not a guess.
 These results should be taken into consideration when deciding whether to switch to Dapr.
 
 > As Gamora asked Thanos: **“What did it cost?”**
 > And Thanos replied: **“Everything.”**
 
-## The six connectors
+## The eight connectors
 
-| Connector         | Path                                | Operations      |
-| ----------------- | ----------------------------------- | --------------- |
-| `nats-direct`     | app → nats.go (JetStream, acked)    | `publish`       |
-| `nats-dapr`       | app → gRPC → daprd → NATS JetStream | `publish`       |
-| `postgres-direct` | app → pgx → PostgreSQL              | `write`, `read` |
-| `postgres-dapr`   | app → gRPC → daprd → PostgreSQL     | `write`, `read` |
-| `redis-direct`    | app → go-redis → Redis              | `write`, `read` |
-| `redis-dapr`      | app → gRPC → daprd → Redis          | `write`, `read` |
+| Connector         | Path                                        | Heavy ops         | Light op `stat`              |
+| ----------------- | ------------------------------------------- | ----------------- | ---------------------------- |
+| `nats-direct`     | app → nats.go (JetStream, acked)            | `publish`         | 1-byte acked publish         |
+| `nats-dapr`       | app → gRPC → daprd → NATS JetStream         | `publish`         | 1-byte publish               |
+| `postgres-direct` | app → pgx → PostgreSQL                      | `write`, `read`   | `SELECT 1 WHERE key`         |
+| `postgres-dapr`   | app → gRPC → daprd → PostgreSQL             | `write`, `read`   | get of a 1-byte marker row   |
+| `redis-direct`    | app → go-redis → Redis                      | `write`, `read`   | `EXISTS`                     |
+| `redis-dapr`      | app → gRPC → daprd → Redis                  | `write`, `read`   | get of a 1-byte marker key   |
+| `fs-direct`       | app → os file I/O on a shared volume        | `write`, `read`   | `stat` of the file           |
+| `fs-dapr`         | app → gRPC → daprd → localstorage binding   | `write`, `read`   | get of a 1-byte marker file  |
 
-A run compares **one pair** — a backend's direct and Dapr connectors — and never more than
-two connectors. Within a run the two are measured **one at a time**, never concurrently, so
-the backend and the sidecar only ever serve the connector being measured. The only difference
-within a pair is the sidecar hop.
+Heavy operations carry the payload; `stat` is the lightest call each API offers that touches a
+key without moving data. Together they separate per-call overhead from the cost of moving
+bytes. The Dapr state and binding APIs have no exists call, so their `stat` fetches a one-byte
+marker record seeded next to every key.
+
+A run compares one pair, a backend's direct and Dapr connectors, measured one at a time so the
+backend and the sidecar only ever serve the connector under test. Only that backend's
+containers are started. The only difference within a pair is the sidecar hop.
 
 ```mermaid
 flowchart LR
@@ -33,226 +40,208 @@ flowchart LR
     NATS[("NATS")]
     PG[("PostgreSQL")]
     Redis[("Redis")]
+    FS[("filesystem")]
     Dapr["daprd sidecar"]
 
     App/Agent -->|native SDK| NATS
     App/Agent -->|native SDK| PG
     App/Agent -->|native SDK| Redis
+    App/Agent -->|os| FS
     App/Agent -->|gRPC| Dapr
     Dapr --> NATS
     Dapr --> PG
     Dapr --> Redis
+    Dapr -->|localstorage| FS
 ```
 
 ## Quick start
 
 ```sh
-make sweep BACKEND=redis     # build + start the stack, sweep redis-direct vs redis-dapr, follow the log
-make sweep-all               # nats, postgres, redis back to back, one trace file each
+make sweep BACKEND=redis     # start redis + the pair + sidecar, sweep redis-direct vs redis-dapr, follow the log
+make sweep-all               # nats, postgres, redis, fs back to back, one trace file each
 make plots                   # charts + summary tables from traces/*.jsonl into plots/
 make down                    # tear everything down
 ```
 
-A sweep writes `traces/<timestamp>-<backend>.jsonl` and exits. While it runs, bench metrics are
-on <http://localhost:9100/metrics>, the sidecar's on <http://localhost:9090/metrics>, and
-Prometheus on <http://localhost:9091>.
+Each run writes `traces/<timestamp>-<backend>.jsonl` and exits. The large-payload and
+million-agent points need a machine with memory to match; see
+[sizing](docs/traces-and-plots.md#sizing-the-machine).
 
-## How a sweep works
+## Dimensions
 
-Load has three dimensions, and the sweep varies each one while holding the other two at a
-baseline (`SWEEP_MODE=oat`, one at a time), or measures every combination (`SWEEP_MODE=grid`):
+A step is a fixed amount of work: **tasks** (operations) shared by **agents** (concurrent
+callers), each moving a **payload**. Every agent is closed loop: it takes the next task the
+moment its previous call returns, so a step measures how fast a path serves that many callers,
+and the makespan is how long the group waits for all its work to finish. Two dimensions are
+swept, each under its own profile rather than every combination: large payloads are moved by a
+single agent, and many agents move a small payload.
 
-| Dimension           | Baseline   | Levels swept (default)   | Meaning                                     |
-| ------------------- | ---------- | ------------------------ | ------------------------------------------- |
-| `RATE`              | 200 ops/s  | `0, 50, 200, 1000, 5000, 20000, 50000, 100000` | requests per second the callers try to send |
-| `PAYLOAD_BYTES`     | 256 B      | `256, 1024, 4096, 16384` | value size per operation                    |
-| `CONCURRENCY`       | 8 callers  | `1, 8, 32, 128`          | concurrent callers ("agents")               |
+| Dimension       | Levels                                                            | Range           | Driven as                         |
+| --------------- | ----------------------------------------------------------------- | --------------- | --------------------------------- |
+| **Agents**      | `1, 8, 32, 128, 512, 2048, 8192, 32768, 131072, 1000000`          | 1 to 1,000,000  | 256 B payload                     |
+| **Payload**     | `256, 1024, 4096, 16384, 1 MiB, 16 MiB, 128 MiB, 1 GiB`           | 256 B to 1 GiB  | 1 agent                           |
+| **Tasks**       | `TASKS`, default 100,000                                          | any             | shrinks with payload, never below the agents |
 
-For every point the sweep, in order:
+Tasks alternate over a connector's ops (`write`, `read`, `stat`, ...), so each op gets an
+equal share and is reported on its own. At large payloads the tasks shrink so a step never
+moves more than 8 GiB (8192 tasks at 1 MiB, 8 at 1 GiB), and the keyspace shrinks so the
+seeded dataset stays under 256 MiB. Per op: 5 s deadline; per step: 30 min deadline, after
+which the step is recorded as truncated. See [docs/methodology.md](docs/methodology.md) for the
+procedure and [docs/traces-and-plots.md](docs/traces-and-plots.md) for every knob.
 
-1. sets the payload size, then for each connector of the pair:
-2. **seeds** the keyspace through the connector's `write` op, so a `read` never misses;
-3. runs a **warmup** (`STEP_WARMUP`, discarded);
-4. **measures** for `STEP_DURATION`, then rests for `STEP_COOLDOWN` before the next connector.
+## Experiments
 
-Operations of a connector alternate (`write`, `read`, `write`, ...) and each is timed on its
-own, so a connector with two ops reports two records per point.
+Every experiment is the same binary with different levels, so runs are additive: the plotter
+merges every trace in `traces/`, and the later measurement of a point wins. Pick a backend
+with `BACKEND=` (nats, postgres, redis, fs); the commands below show one. An empty list skips
+a dimension.
 
-### Open-loop load and stall time
+### 1. Per-call overhead
 
-With a `RATE`, the load is **open loop**: operation *k* is due at `start + k / RATE` whether or
-not the previous ones have returned, exactly as a fleet of agents keeps arriving regardless of
-how the backend is doing. Each caller takes the next due operation; if it is already overdue,
-the overdue time is recorded as **stall** — the queueing delay the caller sat through before
-the call could even begin.
-
-| Measure     | What the timer brackets                                             |
-| ----------- | ------------------------------------------------------------------- |
-| **latency** | the call itself, from send to return                                |
-| **stall**   | from the moment the operation was due to the moment the call began  |
-| **wait**    | stall + latency: what an agent experiences, from wanting to done    |
-
-Stall is zero while a connector keeps up with the target rate, and grows for the whole
-window once it cannot. That is the number for agentic workloads: latency says how fast a
-call is, stall says how long agents queue behind a saturated path. Because stall is
-measured against the schedule rather than the previous call, the results are not subject
-to coordinated omission — a slow connector cannot hide its slowness by sending less.
-
-`RATE=0` is a **closed loop**: each caller fires again as soon as its call returns, so the
-throughput measured is the path's ceiling rather than a target. Stall is not defined there
-and is reported as zero. The default sweep includes one closed-loop point on the RPS axis, so
-every run carries both the paced comparison and each path's capacity.
-
-### Reading throughput
-
-At a fixed target rate, throughput is an input: a path that keeps up delivers exactly the
-target, so both lines sit on the same diagonal and the interesting numbers are latency and
-stall. Throughput only separates the two paths once one of them cannot keep up, which is why
-the rate axis climbs to 100000 and ends with the closed-loop point. Read it as: the RPS at
-which the Dapr line bends away from the diagonal is where the sidecar saturates, and the
-closed-loop point is how much each path can do at all.
-
-## Traces
-
-Every step is one JSON line in `traces/<sweep>.jsonl`, after a header line describing the
-plan. A record carries the point, the connector, and every measurement:
-
-```json
-{"type":"step","sweep":"20260927T101500Z-redis","captured_at":"2026-09-27T10:16:22Z",
- "dimension":"rate","rate":1000,"payload_bytes":256,"concurrency":8,"keyspace":1000,
- "connector":"redis-dapr","backend":"redis","mode":"dapr","op":"write",
- "paced":true,"elapsed_seconds":30.0,"achieved_rate":998.7,
- "ops":14981,"errors":0,"timeouts":0,"throughput":499.4,
- "latency":{"p50":0.00071,"p95":0.00112,"p99":0.00164,"mean":0.00075,"max":0.0121},
- "stall":{"p50":0.00002,"p95":0.00009,"p99":0.00031,"mean":0.00003,"max":0.0018},
- "wait":{"p50":0.00073,"p95":0.00119,"p99":0.00181,"mean":0.00078,"max":0.0126}}
-```
-
-Times are seconds. A record whose `errors` is non-zero also carries `first_error`, the message
-of the first failure, so an error count is never a mystery. `throughput` counts successful
-operations per second of the measured window; `achieved_rate` is what the connector actually issued across all its ops, against the
-target `rate`. `dimension` says which axis the point belongs to (`baseline` is the point
-shared by all three curves in one-at-a-time mode). Percentiles come from a log-linear
-histogram with 1% resolution, computed in the app from every operation of the step, not
-sampled from a scrape.
-
-### Plotting
+*What does the sidecar hop cost on its own?*
 
 ```sh
-make plots                              # every trace
-make plots FILES="traces/2026*-redis.jsonl"
+SWEEP_AGENTS=1,8 SWEEP_PAYLOAD_BYTES= make sweep BACKEND=redis
 ```
 
-For each backend, operation and dimension this writes one SVG into `plots/<backend>/`
-(`write_vs_rps.svg`, `read_vs_payload.svg`, `write_vs_users.svg`, ...) with four panels —
-p50 latency, p99 latency, throughput, error rate — and a direct and a Dapr line in each. Direct
-is always a solid blue line, Dapr always a dashed orange one, so the two stay tellable where they
-overlap. Throughput against RPS is on a log axis: a path that keeps up with its target is a
-straight diagonal, and one that falls behind bends away from it. The closed-loop point sits in
-its own slot at the right end of the RPS axis, as a lone marker, since it is a ceiling rather
-than a rate. Next to the charts, `plots/<backend>/summary.md` tabulates
-every point with the Dapr-vs-direct ratio, and the same table is printed to stdout. The p95,
-stall and wait numbers are in the trace records for anyone who wants to chart them.
+Read `stat_vs_agents.svg`: the light op is almost pure per-call overhead, so the gap between
+the lines is the hop itself. Compare with `write_vs_agents.svg` to see how much of a heavy
+op's cost is the hop. Seconds per step.
 
-It is **standard-library Python only**: no matplotlib, no virtualenv. If two traces cover the
-same point, the later capture wins.
+### 2. Scaling with agents
 
-## Configuration
-
-All knobs are environment variables on the `bench` service in
-[docker-compose.yml](deploy/docker-compose.yml); each can be overridden on the `make` line.
-
-| Variable                                     | Meaning                                                          |
-| -------------------------------------------- | ---------------------------------------------------------------- |
-| `CONNECTORS`                                 | the pair to compare, e.g. `nats-direct,nats-dapr` (at most two)  |
-| `RATE`, `PAYLOAD_BYTES`, `CONCURRENCY`       | the baseline point                                               |
-| `SWEEP_RATE`, `SWEEP_PAYLOAD_BYTES`, `SWEEP_CONCURRENCY` | levels per dimension; set a list empty to skip that dimension |
-| `SWEEP_MODE`                                 | `oat` (default) or `grid`                                        |
-| `KEYSPACE`                                   | distinct keys cycled through                                     |
-| `STEP_WARMUP`, `STEP_DURATION`, `STEP_COOLDOWN` | per connector per point: discarded, measured, idle             |
-| `OP_TIMEOUT`                                 | per-operation deadline; a hit counts as an error and a timeout   |
+*How does each path scale as more callers share the work, and where does it saturate?*
 
 ```sh
-# a longer, narrower experiment: only the rate axis, one minute per step
-make sweep BACKEND=postgres SWEEP_PAYLOAD_BYTES= SWEEP_CONCURRENCY= \
-  SWEEP_RATE=100,500,2000,10000 STEP_DURATION=60s
+SWEEP_AGENTS=1,8,32,128,512,2048 SWEEP_PAYLOAD_BYTES= make sweep BACKEND=postgres
 ```
 
-The default sweep is 14 points; at two connectors and 40 seconds per step it takes about
-19 minutes per backend. The top rates and the closed-loop point are there to push each path
-past its capacity so the throughput and stall curves have something to show.
+In `write_vs_agents.svg` throughput should climb and then flatten; where the direct line keeps
+climbing and the Dapr line flattens, the sidecar is the bottleneck. The `makespan` column of
+`summary.md` is the agents' view: how long the whole batch took. Minutes per backend.
 
-Runs are additive: the plotter merges every trace it is given, and where two traces measured
-the same point the later one wins. So a run that adds levels to one dimension, for example
-`SWEEP_RATE=0,50000,100000 SWEEP_PAYLOAD_BYTES= SWEEP_CONCURRENCY=`, extends earlier
-traces rather than replacing them.
+### 3. Fan-in: thousands to a million agents
 
-### Live view
+*Where does the client, the sidecar, or the storage break under massive concurrency?*
 
-The app also exports Prometheus metrics for watching a step as it happens:
+```sh
+TASKS=1000000 SWEEP_AGENTS=8192,32768,131072,1000000 SWEEP_PAYLOAD_BYTES= make sweep BACKEND=redis
+```
 
-| Metric                      | Meaning                                                      |
-| --------------------------- | ------------------------------------------------------------ |
-| `bench_op_duration_seconds` | latency histogram, labelled `backend` / `mode` / `op`        |
-| `bench_op_stall_seconds`    | stall histogram, same labels                                 |
-| `bench_ops_total`           | attempts, also labelled `status`                             |
-| `bench_step_info`           | the point being measured right now, as labels                |
-| `bench_connector_up`        | `1` per connector that connected                             |
+A million tasks so every agent has work. Watch latency and the error-rate panel together: the
+direct Redis and Postgres clients hold 32 connections, so agents queue on the pool, the queue
+becomes latency and then 5 s timeouts. On the Dapr side the sidecar's stream limit does the
+same. The level at which errors appear is the breakpoint. Needs 32 to 64 GB of RAM at the
+top level; see [sizing](docs/traces-and-plots.md#sizing-the-machine).
 
-[rules.yml](deploy/prometheus/rules.yml) records `bench:latency_p50/p95/p99`,
-`bench:stall_p50/p99` and `bench:throughput`. These are a window into the run, not its record;
-the trace file is the record.
+### 4. Bytes moved: payload scaling
 
-## Fairness notes
+*How does each path scale with value size, and what does the hop cost relative to the bytes?*
 
-Benchmarks like this are easy to rig by accident. Each of these is enforced by the code:
+```sh
+SWEEP_AGENTS= SWEEP_PAYLOAD_BYTES=256,4096,65536,1048576,16777216 make sweep BACKEND=fs
+```
 
-- **One connector at a time.** The pair never shares the backend or the sidecar while being
-  measured, and a cooldown separates them so one step's tail never bleeds into the next.
-- **Open-loop pacing against a schedule**, so a slow path cannot lower its own load; the
-  time it falls behind is measured as stall rather than lost.
-- **The keyspace is seeded before every step**, through the connector under test, so reads
-  never miss and the first seconds are not a cold-start artefact.
-- **NATS publishes wait for the JetStream ack on both sides.** Dapr's component calls
-  the synchronous `jsc.Publish`, and so does the direct connector. Comparing against a
-  fire-and-forget core NATS publish would measure buffering, not overhead.
-- **Postgres statement shapes match** — upsert on write, point select on read. Dapr
-  uses its own table, so neither path pollutes the other.
-- **Sidecar tracing is disabled** — it logs `TraceIDRatioBased{0}` at startup. A trace
-  exporter would add latency to the thing being measured.
-- **App and sidecar share a network namespace**, exactly like a Kubernetes pod, so the
-  gRPC hop is loopback rather than a Docker bridge.
-- **Warmup measurements are discarded**, so cold pools do not skew the first seconds.
-- **Identical payload, keyspace, rate and concurrency** for both connectors at every point.
+One agent. `write_vs_payload.svg` and `read_vs_payload.svg` should slope up with size;
+`stat_vs_payload.svg` should stay flat, because the light op never moves the payload. Where
+the Dapr heavy line pulls away from the direct one faster than the hop alone explains, the
+component is doing extra work on the bytes (base64, Lua, CloudEvent).
 
-### What the sidecar hop does *not* explain
+### 5. Size limits
 
-Dapr's components do not store data the way a direct client would, and none of it is
-switchable. It is a real cost of adopting Dapr, so it stays in the measurement — but it
-means the overhead is not purely "one gRPC hop":
+*Which path refuses a value first, and at what size?*
 
-|              | Direct                  | Through Dapr                                                                                         |
-| ------------ | ----------------------- | ---------------------------------------------------------------------------------------------------- |
-| **Redis**    | `SET` of a plain string | Lua `EVAL` → `HSET` of `{data, version}`, key prefixed `bench\|\|`                                   |
-| **Postgres** | `bytea`                 | base64 inside `jsonb` (~1.4× the bytes) plus `isbinary` / `insertdate` / `updatedate` / `expiredate` |
-| **NATS**     | raw payload             | CloudEvent envelope plus `Nats-MsgId` dedup                                                          |
+```sh
+SWEEP_AGENTS= SWEEP_PAYLOAD_BYTES=67108864,134217728,536870912,1073741824 OP_TIMEOUT=60s make sweep BACKEND=postgres
+```
 
-So Redis in particular is Dapr doing strictly *more work* — a scripted
-read-modify-write of a hash — than the plain `SET` it is compared against.
+The error-rate panel goes to 100% where a path hits a ceiling, and `first_error` in the trace
+says whose: NATS at 64 MB, Dapr's Postgres store near 255 MB (`jsonb`), Redis at 512 MB,
+Postgres `bytea` at 1 GB, gRPC at 2 GiB for everything through Dapr. Tasks and keyspace shrink
+to a handful at these sizes. Needs 6x the largest value in RAM across app and sidecar.
 
-**Not measured at all:** resilience, retries, mTLS, observability, portability. The
-sidecar hop buys those things; this project only prices it.
+### 6. Many keys, many files
+
+*Does a large dataset change the picture: cache misses, directory size, index depth?*
+
+```sh
+KEYSPACE=1000000 MAX_DATASET_BYTES=1073741824 TASKS=1000000 SWEEP_AGENTS=8,512 SWEEP_PAYLOAD_BYTES= make sweep BACKEND=fs
+```
+
+A million keys at 256 B, a million tasks. Compare against experiment 2 at 1000 keys: a flat
+difference is the hop, a growing one is the storage (Postgres index depth, a million-entry
+directory, Redis memory). Seeding a million keys dominates the time (about ten minutes per step
+for `fs-dapr`), and the data disk needs a few million inodes (XFS, or ext4 formatted with more).
+
+### 7. Payload and agents together
+
+*Do the two dimensions interact?*
+
+```sh
+SWEEP_MODE=grid SWEEP_PAYLOAD_BYTES=256,65536,1048576 SWEEP_AGENTS=1,32,512 make sweep BACKEND=redis
+```
+
+Every combination. The plotter writes one chart per held level
+(`write_vs_payload_at_agents32.svg`, ...), so the family of curves shows whether large values
+under many agents degrade faster than either dimension alone. Memory is agents times payload
+times a few copies: keep the product small.
+
+### 8. A big batch
+
+*How long do N agents take to get a million operations done, with and without Dapr?*
+
+```sh
+TASKS=1000000 AGENTS=64 PAYLOAD_BYTES=4096 SWEEP_AGENTS= SWEEP_PAYLOAD_BYTES= make sweep BACKEND=redis
+```
+
+One point, a million tasks. The `makespan` column of `summary.md` is the answer, and the
+`timeouts` and `first_error` fields say whether the rare 5-second hangs on the Dapr path
+recurred over a long batch. Repeat with `OP_TIMEOUT=1s` to count hangs a 5 s deadline hides.
+
+### 9. Storage versus storage
+
+*Which backend falls behind first, sidecar aside?*
+
+```sh
+COMPOSE_PROFILES=redis,postgres CONNECTORS=redis-direct,postgres-direct SWEEP_PAYLOAD_BYTES= make sweep
+```
+
+Two direct connectors instead of a pair. The plotter charts backends separately, so read the
+`summary.md` tables side by side. Any two direct connectors work (`fs-direct,redis-direct`,
+`nats-direct,postgres-direct`); start the profiles of every backend involved. A Dapr connector
+can be mixed in only for the backend named by `BACKEND`, since the sidecar loads that backend's
+component alone.
+
+### Everything
+
+```sh
+make sweep-all     # nats, postgres, redis, fs with the default levels: experiments 1 to 5 in one go
+```
+
+## Results
+
+No results are checked in yet for this version of the benchmark. Run a sweep and `make plots`;
+charts land in `plots/<backend>/` with a `summary.md` beside them.
+
+## Documentation
+
+- [docs/methodology.md](docs/methodology.md): the step model (tasks, agents, payload), the
+  sweep profiles, how tasks and keyspace shrink with payload, fairness notes.
+- [docs/traces-and-plots.md](docs/traces-and-plots.md): the trace record format, plotting,
+  every configuration variable, the Prometheus live view.
 
 ## Layout
 
 ```
 cmd/bench/            entrypoint: builds the pair, connects, runs the sweep
 internal/connector/   one file per backend, holding both its direct and Dapr client
-internal/runner/      one measured step: open-loop pacing, stall accounting
+internal/runner/      one measured step: tasks shared by closed-loop agents
 internal/sweep/       the load schedule and the trace writer
 internal/stats/       log-linear histogram behind the percentiles
 internal/metrics/     Prometheus exporter for the live view
 deploy/               compose stack, Dapr components, Prometheus config + rules
 scripts/              the SVG plotter and summary table
-traces/               one .jsonl per sweep
+docs/                 methodology and reference
+traces/               one .jsonl per run
+plots/                charts and summary tables generated from traces/ (not checked in)
 ```

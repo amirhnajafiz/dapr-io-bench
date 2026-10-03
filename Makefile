@@ -1,13 +1,20 @@
 COMPOSE := docker compose -f deploy/docker-compose.yml
 
-# Backend whose direct/Dapr pair `make sweep` compares: nats, postgres or redis.
+# Backend whose direct/Dapr pair `make sweep` compares: nats, postgres, redis or fs.
+# Only that backend's containers are started (compose profiles), so a run is
+# the pair, the sidecar, Prometheus and one backend.
 BACKEND ?= redis
+export BACKEND
 export CONNECTORS ?= $(BACKEND)-direct,$(BACKEND)-dapr
+export COMPOSE_PROFILES ?= $(BACKEND)
 
-.PHONY: up sweep sweep-all wait down logs build test plots clean
+.PHONY: up sweep sweep-all wait down logs build test plots
 
 ## up: build and start the stack; the bench sweeps $(CONNECTORS) and exits
 up:
+	# the bench writes traces as uid 10001 into this bind mount; on a Linux host
+	# the directory is owned by whoever cloned the repo, so open it up
+	@mkdir -p traces && chmod a+rwx traces
 	$(COMPOSE) up --build -d
 	# The sidecar shares the app container's network namespace, which is fixed at
 	# creation time. Rebuilding the app replaces that container, so the sidecar
@@ -21,9 +28,9 @@ up:
 sweep: up
 	$(COMPOSE) logs -f bench
 
-## sweep-all: the three backends back to back, each one its own run and trace file
+## sweep-all: every backend back to back, each one its own run and trace file
 sweep-all:
-	@for b in nats postgres redis; do \
+	@for b in nats postgres redis fs; do \
 	  $(MAKE) --no-print-directory sweep BACKEND=$$b; \
 	  $(MAKE) --no-print-directory wait; \
 	done
@@ -34,7 +41,7 @@ wait:
 
 ## down: stop everything and remove volumes
 down:
-	$(COMPOSE) down -v
+	$(COMPOSE) --profile '*' down -v
 
 ## logs: follow the benchmark app's output
 logs:
@@ -53,7 +60,3 @@ test:
 FILES ?= traces/*.jsonl
 plots:
 	@./scripts/plot_results.py $(FILES) -o plots
-
-## clean: remove generated charts
-clean:
-	rm -rf plots

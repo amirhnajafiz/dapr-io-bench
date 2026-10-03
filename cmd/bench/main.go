@@ -76,7 +76,9 @@ func main() {
 // backends and the sidecar. A connector that never comes up is reported as down
 // and skipped rather than aborting the whole comparison.
 func connect(ctx context.Context, candidates []connector.Connector) []connector.Connector {
-	const attempts = 10
+	// backends start alongside the bench rather than ahead of it, so give them
+	// a minute to come up
+	const attempts = 30
 
 	var connected []connector.Connector
 	for _, c := range candidates {
